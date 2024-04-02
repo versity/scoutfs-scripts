@@ -3,9 +3,12 @@
 This collection of benchmarking scripts can be used to test various aspects of ScoutAM systems. The current focus is device performance for ScoutFS filesystems.
 
 > [!CAUTION]
-> The benchmarks described in this document are destructive to data/metadata previously written to devices.
 >
-> DO NOT RUN THESE BENCHMARKS ON PRODUCTION SYSTEMS WITHOUT EXTREME CAUTION!
+> !!!CAN DESTROY DATA WRITTEN TO DEVICES. USE AT YOUR OWN RISK!!!
+>
+> The benchmarks described in this document are destructive to data/metadata previously written to devices. DO NOT RUN ON PRODUCTION SYSTEMS WITHOUT EXTREME CAUTION AND BACKUPS OF IMPORTANT DATA.
+>
+> Versity is not responsible for data loss due to running these benchmarks improperly.
 
 ## FIO I/O Benchmarks ##
 
