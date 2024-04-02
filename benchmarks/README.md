@@ -8,7 +8,7 @@ This collection of benchmarking scripts can be used to test various aspects of S
 >
 > The benchmarks described in this document are destructive to data/metadata previously written to devices. DO NOT RUN ON PRODUCTION SYSTEMS WITHOUT EXTREME CAUTION AND BACKUPS OF IMPORTANT DATA.
 >
-> Versity is not responsible for data loss due to running these benchmarks improperly.
+> Versity is not responsible for data loss due to running these benchmarks improperly or without appropriate considerations for data.
 
 ## FIO I/O Benchmarks ##
 
