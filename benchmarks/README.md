@@ -33,6 +33,8 @@ The `DEVICE` parameter can be a system disk such as `/dev/sdX`, a multipath devi
 
 The `JOBS` parameter is the number of simultaneous `OPERATION` to run against the target `DEVICE`. Where `OPERATION` is either `write` or `read`.
 
+Each time the script runs, it will create an `fio` job file called `test.fio` and save the output of the full `fio` run to `test.fio.log`.
+
 The following example runs multiple operations with `1` or `4` jobs:
 
 ```bash
@@ -77,6 +79,8 @@ Example running different scenarios for write and read with `1` and `4` jobs:
 ./fio_gen.sh /dev/md/scoutfs_data 1 read
 ./fio_gen.sh /dev/md/scoutfs_data 4 read
 ```
+
+Each time the script runs, it will create an `fio` job file called `test.fio` and save the output of the full `fio` run to `test.fio.log`.
 
 The output of the script is identical to the `fio_gen_meta.sh` script, but the more important results are the read and write bandwidth numbers at the bottom:
 
