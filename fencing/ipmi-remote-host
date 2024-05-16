@@ -8,15 +8,26 @@
 SCOUTFS_IPMI_CONFIG_FILE=${SCOUTFS_IPMI_CONFIG_FILE:-/etc/scoutfs/scoutfs-ipmi.conf}
 SCOUTFS_IPMI_HOSTS_FILE=${SCOUTFS_IPMI_HOSTS_FILE:-/etc/scoutfs/scoutfs-ipmi-hosts.conf}
 
-## hosts file format
+## scoutfs-ipmi.conf file format:
+##
+## IPMI_USER="user"
+## IPMI_PASSWORD="password"
+## IPMI_OPTS="-D LAN_2_0 -u $IPMI_USER -p $IPMI_PASSWORD -I 17"
+## SSH_USER="user"
+## SSH_IDENTS="-i /home/user/.ssh/id_rsa -i /home/user/.ssh/id_rsa.pub"
+
+## hosts file format:
 ## SCOUTFS_HOST_IP IPMI_ADDRESS
 ## ex:
 #  192.168.1.1     192.168.10.1
 
 # command setup
 IPMI_POWER="/sbin/ipmipower"
-SSH_CMD="ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no"
 LOGGER="/bin/logger -p local3.crit -t scoutfs-fenced"
+
+# SSH setup to allow non-root SSH connections
+SSH_USER="root"
+SSH_IDENTS=""
 
 $LOGGER "ipmi fence script invoked: IP: $SCOUTFS_FENCED_REQ_IP RID: $SCOUTFS_FENCED_REQ_RID TEST: $IPMITEST"
 
@@ -53,6 +64,8 @@ test -x "$IPMI_POWER" || \
 
 export ip="$SCOUTFS_FENCED_REQ_IP"
 export rid="$SCOUTFS_FENCED_REQ_RID"
+
+SSH_CMD="ssh -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -q -l $SSH_USER $SSH_IDENTS"
 
 getIPMIhost () {
     host=$(awk -v ip="$1" '$1 == ip {print $2}' "$SCOUTFS_IPMI_HOSTS_FILE") || \
