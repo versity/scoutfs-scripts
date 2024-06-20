@@ -1,4 +1,7 @@
-FROM golang:latest
+ARG GOLANG_IMAGE_NAME="golang"
+ARG GOLANG_IMAGE_VERSION="latest"
+
+FROM ${GOLANG_IMAGE_NAME}:${GOLANG_IMAGE_VERSION}
 
 # Set build arguments with default values
 ARG VERSION="none"
