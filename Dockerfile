@@ -19,5 +19,6 @@ COPY fencing/fence-remote-host /scoutfs-fencing/
 COPY fencing/README.md /scoutfs-fencing/
 
 COPY package.sh /
+COPY nfpm.yaml /scoutfs-fencing/
 
 ENTRYPOINT [ "/bin/bash" ]
