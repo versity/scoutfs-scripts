@@ -21,4 +21,4 @@ COPY fencing/README.md /scoutfs-fencing/
 COPY package.sh /
 COPY nfpm.yaml /scoutfs-fencing/
 
-ENTRYPOINT [ "/bin/bash" ]
+ENTRYPOINT [ "/package.sh" ]
