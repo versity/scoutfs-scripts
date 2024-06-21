@@ -17,5 +17,7 @@ umask: 0o002
 contents:
 - src: /scoutfs-fencing/fence-remote-host
   dst: /usr/libexec/scoutfs-fenced/run/fence-remote-host
+- src: /scoutfs-fencing/ipmi-remote-host
+  dst: /usr/libexec/scoutfs-fenced/run/ipmi-remote-host
 - src: /scoutfs-fencing/README.md
   dst: /usr/libexec/scoutfs-fenced/run/README.md
