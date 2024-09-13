@@ -10,6 +10,10 @@ The `ipmi-remote-host` script is the default fencing script for ScoutFS for envi
 
 Documentation for `ipmi-remote-host` script, configuration, and operations is available at [ScoutFS Fencing](https://docs.versity.com/docs/scoutfs-fencing).
 
+# `fence-single-node` #
+
+The `fence-single-node` is a simplified fencing script for ScoutAM instances with single nodes. The script essentially checks to see if the filesystem is mounted on the node. If it is not, the fencing request is cleared correctly.
+
 # `fence-remote-host` #
 
 The `fence-remote-host` script supports direct IPMI, indirect IPMI using `powerman`, and VM environments with vSphere.
