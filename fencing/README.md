@@ -14,6 +14,16 @@ Documentation for `ipmi-remote-host` script, configuration, and operations is av
 
 The `fence-single-node` is a simplified fencing script for ScoutAM instances with single nodes. The script essentially checks to see if the filesystem is mounted on the node. If it is not, the fencing request is cleared correctly.
 
+## Installation ##
+
+Steps for installing the `fence-single-node` script:
+
+1. Download the `fence-single-node` script from this repository
+2. Copy to `/usr/libexec/scoutfs-fenced/run/fence-single-node`
+3. Make executable `chmod 700 /usr/libexec/scoutfs-fenced/run/fence-single-node`
+4. Edit `/etc/scoutfs/scoutfs-fenced.conf` and set `SCOUTFS_FENCED_RUN=/usr/libexec/scoutfs-fenced/run/fence-single-node`
+5. Enable and start the ScoutFS fencing service `systemctl enable scoutfs-fenced ; systemctl start scoutfs-fenced`
+
 # `fence-remote-host` #
 
 The `fence-remote-host` script supports direct IPMI, indirect IPMI using `powerman`, and VM environments with vSphere.
