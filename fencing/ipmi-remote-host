@@ -43,11 +43,11 @@ echo_log() {
 }
 
 echo_test_pass() {
-    echo -e "\xE2\x9C\x94 $@"
+    echo -e "PASS: $@"
 }
 
 echo_test_fail() {
-    echo -e "\xE2\x9D\x8C $@"
+    echo -e "FAIL: $@"
 }
 
 test -n "$SCOUTFS_IPMI_CONFIG_FILE" || \
