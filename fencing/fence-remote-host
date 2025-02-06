@@ -180,7 +180,7 @@ check_host_port() {
         return 1
     fi
 
-    if ! "$NC" --wait 1 -z "$host" "$port"
+    if ! "$NC" -w 1 -z "$host" "$port"
     then
         echo_error "(nc) Host ${host}:${port} not available"
         return 1
