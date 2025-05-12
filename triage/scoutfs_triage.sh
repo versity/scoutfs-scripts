@@ -22,7 +22,6 @@ mkdir sysfs
 cp -ar /sys/fs/scoutfs sysfs/
 
 # Capture entire debugfs tree /sys/kernel/debug/scoutfs
-tar cf debugfs.scoutfs.tar /sys/kernel/debug/scoutfs
 mkdir debugfs
 cp -ar /sys/kernel/debug/scoutfs debugfs/
 
