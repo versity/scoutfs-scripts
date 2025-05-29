@@ -93,3 +93,4 @@ then
 	PERF=$(grep -e READ -e "bw=" "$RD_RESULTS")
 	printf "SUMMARY: %s %s\n" "$HOST" "$PERF"
 fi
+
