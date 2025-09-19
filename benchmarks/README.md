@@ -22,6 +22,28 @@ The `fio` utility is available from the base RHEL repo and can be installed usin
 yum install -y fio
 ```
 
+### General File Benchmark - `run_fio_test.sh` ###
+
+Use this script first to test file I/O with the `fio` program:
+
+```
+Usage: run_fio_test.sh --op wr|rd|rw --dir PATH --files N --size SIZE --time SECONDS [--bs BLOCKSIZE] [--ratio W:R] [--wrate RATE] [--rrate RATE] [--fallocate MODE] [--drop_caches]
+  --ratio W:R : For rw test, creates N*W write files and N*R read files (default 1:1)
+  --wrate RATE : Limit write bandwidth (e.g., 100M will limit writes to 100 MB/sec)
+  --rrate RATE : Limit read bandwidth (e.g., 100M will limit read rates to 100 MB/sec)
+  --fallocate MODE : Set file allocation mode (none|native|posix, default: native)
+```
+
+#### Simulating Archiving and Staging ####
+
+This script is helpful for simulated archiving and staging by setting the `--rrate RATE` or `--wrate RATE` to the native speeds of tape drives. For example, to simulate ingest (uncapped) and archiving to 12 LTO-8 tape drives (360 MB/sec native speed), run the following:
+
+```
+./run_fio_test.sh --op rw --dir /mnt/scoutfs2/nds --files 6 --size 1G --time 90 --bs 1M --ratio 1:2 --drop_caches --rrate 360M
+```
+
+This simulates six streams of uncapped write, while archiving to 12 LTO-8 drives capped at 360 MB/sec.
+
 ### Metadata Device Benchmark - `fio_gen_meta.sh` ###
 
 The `fio_gen_meta.sh` script can measure the IOPS of metadata devices intended for ScoutFS metadata storage.
