@@ -1,0 +1,538 @@
+#!/bin/bash
+
+#
+# Universal/Generic Scoutfs Fence Agent Script
+#
+# This script replaces all older scoutfs fence scripts in a transparent
+# way. It re-uses existing configuration data, requires no changes to the
+# existing configuration, and will work regarless whether the system is
+# single node, or multi-fs. It does so by heavily inspecting the state of
+# the system and making sure that it correctly identifies the proper way
+# to fence a target.
+#
+
+LOGGER=${LOGGER:-/bin/logger}
+
+log() { echo -e "$*"; }
+die() { log "$*" > /dev/stderr; exit 1; }
+
+# internal loop control variables
+retries=${retries:-3}
+delay=${delay:-2}
+
+# host/ipmi/etc. config variables
+SCOUTFS_FENCED_CONFIG_FILE=${SCOUTFS_FENCED_CONFIG_FILE:-/etc/scoutfs/scoutfs-fenced.conf}
+IPMI_CONFIG=${IPMI_CONFIG:-/etc/scoutfs/scoutfs-ipmi.conf}
+IPMI_HOSTS=${IPMI_HOSTS:-/etc/scoutfs/scoutfs-ipmi-hosts.conf}
+
+# early checks
+test -r "$IPMI_CONFIG" || die "Missing or unreadable \"$IPMI_CONFIG\" file"
+test -r "$IPMI_HOSTS" || die "Missing or unreadable \"$IPMI_HOSTS\" file"
+
+fence_local_mount()
+{
+	FS_RID=$(grep -slw "${RID}" /sys/fs/scoutfs/*/rid | cut -d/ -f5)
+	if [ -z "${FS_RID}" ]; then
+		#
+		# the mount is no longer there.
+		#
+		log "mount ${RID} no longer mounted."
+		exit 0
+	fi
+	DEV=$(cat "/sys/fs/scoutfs/${FS_RID}/data_device_maj_min")
+	MNTS=$(findmnt -l -n -t scoutfs -o TARGET -S "${DEV}")
+	for MNT in $MNTS; do
+		# send all forced umounts in parallel
+		log "Forcing unmount of \"$MNT\""
+		nohup umount -f "${MNT}" &
+	done
+
+	# now sit and wait.
+}
+
+#
+# Remote fencing agents
+#
+
+# $1 - target IP or hostconf. Will be the same as $IP in case of SSH, but
+# differs if scoutfs-ipmi-hosts.conf is of the old format (2 fields,
+# space separated).
+#
+# if the target contains a ':' character, it is used to determine the ipmi
+# destination port.
+agent_ipmitool()
+{
+	# now read the ipmi config
+	# shellcheck disable=SC1090
+	source "$IPMI_CONFIG" || die "Failed to read \"$IPMI_CONFIG\" file"
+
+	# defaults
+	IPMITOOL="${IPMITOOL:-/bin/ipmitool}"
+	IPMI_RETRIES="${IPMI_RETRIES:-1}"
+	IPMI_OPTS="${IPMI_OPTS:-}"
+	IPMI_USER="${IPMI_USER:-admin}"
+	IPMI_PASS="${IPMI_PASS:-password}"
+
+	test -x "${IPMITOOL}" || die "ipmitool not found."
+
+	local IPMITOOL_CMD="$IPMITOOL -R $IPMI_RETRIES -I lanplus $IPMI_OPTS -U $IPMI_USER"
+	if [[ -r "$IPMI_PASS" ]]; then
+		IPMITOOL_CMD="${IPMITOOL_CMD} -f $IPMI_PASS"
+	elif [[ -n "$IPMI_PASS" ]]; then
+		IPMITOOL_CMD="${IPMITOOL_CMD} -P $IPMI_PASS"
+	fi
+
+	# contains ":" for port?
+	if [[ "$1" =~ ":" ]]; then
+		HOSTARG="-H ${1//:*/} -p ${1//*:/}"
+	else
+		HOSTARG="-H $1"
+	fi
+
+	# in test mode, just check that ipmitool can fetch the power status
+	test $TEST && {
+		OUTPUT=$($IPMITOOL_CMD $IPMI_ARGS $HOSTARG chassis power status)
+		ret=$?
+		if [ $ret -ne 0 ]; then
+			log "Error: \`$IPMITOOL_CMD $IPMI_ARGS $HOSTARG chassis power status\` returned ($ret): \"$OUTPUT\""
+		fi
+		return $ret
+	}
+
+	retry=0; while (( retry++ < retries )); do
+		# shellcheck disable=SC2086
+		OUTPUT=$($IPMITOOL_CMD $IPMI_ARGS $HOSTARG chassis power off)
+		ret=$?
+		if [ $ret -ne 0 ]; then
+			# something went wrong
+			die "Error: \`$IPMITOOL_CMD $IPMI_ARGS $HOSTARG chassis power off\` returned ($ret): \"$OUTPUT\""
+		fi
+		# shellcheck disable=SC2086
+		OUTPUT=$($IPMITOOL_CMD $IPMI_ARGS $HOSTARG chassis power status)
+		ret=$?
+		if [ $ret -ne 0 ]; then
+			die "Error: \`$IPMITOOL_CMD $IPMI_ARGS $HOSTARG chassis power status\` returned ($ret): \"$OUTPUT\""
+		fi
+
+		if [[ "${OUTPUT}" == "Chassis Power is off" ]]; then
+			# success
+			log "Host \"$1\" is powered off"
+			exit 0
+		fi
+
+		log "ipmitool stat $1 not off, retry $retry of $retries"
+		sleep "$delay"
+	done
+
+	# failed after retries
+	die "ipmitool stat $1 not off, exhausted retries"
+}
+
+escape_regex()
+{
+	# shellcheck disable=SC2001
+	sed 's/[][\.^$*+?(){}\\|]/\\&/g' <<< "$1"
+}
+
+check_powerman_server()
+{
+	NC=${NC:-/bin/nc}
+
+	timeout 1 bash -c 'cat < /dev/null > /dev/tcp/'"${1}"'/'"$POWERMAN_PORT"'"'
+	ret=$?
+	if [ "$ret" -ne 0 ]; then
+		log "Unable to reach /dev/tcp/$1/$POWERMAN_PORT"
+	fi
+
+	if ! "$NC" -w 1 -z "$1" "$POWERMAN_PORT"; then
+		log "Unable to reach nc $1:$POWERMAN_PORT"
+		ret=1
+	else
+		ret=0
+	fi
+
+	return "$ret"
+}
+
+agent_powerman()
+{
+	# $1 - powerman target options for a host - the format is
+	# powerman_controller[,powerman_controller[,powerman_controller]]:target
+	pm_servers=$(cut -d: -f1 <<< "$1")
+	pm_node=$(cut -d: -f2 <<< "$1")
+	IFS=',' read -r -a pm_server <<< "$pm_servers"
+
+	# now read the ipmi config
+	# shellcheck disable=SC1090
+	source "$IPMI_CONFIG" || die "Failed to read \"$IPMI_CONFIG\" file"
+
+	POWERMAN="${POWERMAN:-/bin/pm}"
+	POWERMAN_PORT="${POWERMAN_PORT:-10101}"
+
+	test $TEST && {
+		# all the powerman servers must be reachable to pass testing
+		fail=0
+		for s in "${pm_server[@]}"; do
+			OUTPUT=$($POWERMAN -h "$s" --query "$pm_node")
+			ret=$?
+			if [ $ret -ne 0 ]; then
+				log "Error: \`$POWERMAN -h $s --query $pm_node\` returned ($ret): \"$OUTPUT\""
+				fail=1
+			fi
+		done
+		return $fail
+	}
+
+	# now try and reach any pm server listed
+	success=
+	for s in "${pm_server[@]}"; do
+		log "Trying to contact powerman on \"$s\" for host \"$pm_node\""
+
+		if ! check_powerman_server "$s"; then
+			continue
+		fi
+
+		OUTPUT=$($POWERMAN -h "$s" --off "$pm_node")
+		ret=$?
+		if [ $ret -ne 0 ]; then
+			# not fatal, we may try another pm_server instead
+			log "Error: \`$POWERMAN -h $s --off $pm_node\` returned ($ret): \"$OUTPUT\""
+		fi
+
+		OUTPUT=$($POWERMAN -h "$s" --query "$pm_node")
+		ret=$?
+		if [ $ret -ne 0 ]; then
+			# not fatal, we may try another pm_server instead
+			log "Error: \`$POWERMAN -h $s --query $pm_node\` returned ($ret): \"$OUTPUT\""
+		fi
+
+		OUTPUT="${OUTPUT//$'\012'/ }"
+		log "powerman stat output: \"$OUTPUT\""
+
+		regex="off:\s+$(escape_regex "$pm_node")"
+		if [[ "$OUTPUT" =~ $regex ]]; then
+			# success
+			success=1
+			break
+		fi
+	done
+
+	if [[ -n "$success" ]]; then
+		log "Fence power down node \"$pm_node\" from powerman server \"$s\""
+		exit 0
+	fi
+
+	die "Unable to fence node \"$pm_node\": No powerman servers left to try"
+}
+
+agent_vsphere()
+{
+	# $1 - vsphere target options for a host - the format is
+	# vsphereserver:vsphereguest
+	vs_server=$(cut -d: -f1 <<< "$1")
+	vs_guest=$(cut -d: -f2 <<< "$1")
+
+	vs_auth=$(base64 <<< "${VSPHERE_USER}:${VSPHERE_PASS}")
+
+	CURL=${CURL:-/bin/curl}
+	JQ=${JQ:-/bin/jq}
+
+	test -x "$CURL" || die "Curl not found."
+	test -x "$JQ" || die "JQ not found."
+
+	# helper function that extracts `.error_type` from the json result
+	# and errors out if needed.
+	vs_json_error() {
+		vs_error=$("$JQ" -r '.error_type' 2> /dev/null <<< "$vs_json")
+		if [[ -n "$vs_error" && "$vs_error" != "null" ]]; then
+			die "$*: $vs_error"
+		fi
+	}
+
+	# wrap curl/jq calls to fetch/post vsphere API data
+	# use: vs_json=$(vs_curl "GET|POST|DELETE" "apimethod" ...args)
+	# then test with `vs_json_error "fail msg"`
+	vs_curl() {
+		local METHOD=$1; shift
+		local OBJ=$1; shift
+		$CURL --connect-time "${CURL_TIMEOUT:-3}" \
+			-s --insecure --request "${METHOD}" \
+			--header "Content-Type: application/json" \
+			"https://${vs_server}/api/${OBJ}" \
+			"$@"
+	}
+
+	# obtain session using auth
+	if ! vs_json=$(vs_curl POST session -H "Authorization: Basic ${vs_auth}"); then
+		die "Unable to obtain session from VPshere API server ${vs_server}"
+	fi
+	vs_json_error "VShere API auth error"
+
+	# no errors, trim to obtain session
+	vs_session=$(tr -d '"' <<< "$vs_json")
+
+	test ! $TEST && {
+		# send power off
+		if ! vs_json=$(vs_curl POST "vcenter/vm/${vs_guest}/power?action=stop" -H "vmware-api-session-id: ${vs_session}") ; then
+			die "VSphere power off ${vs_guest} failed"
+		fi
+		vs_json_error "vsphere poweroff API error"
+
+		sleep 5
+	}
+
+	# check status
+	if ! vs_json=$(vs_curl GET "vcenter/vm/${vs_guest}/power" -H "vmware-api-session-id: ${vs_session}"); then
+		die "VSphere state ${vs_guest} failed"
+	fi
+	vs_json_error "vsphere state API error"
+
+	# vsphere testing will die on any error at this point, so, assume this is
+	# sufficient testing for now.
+	test $TEST && { return 0; }
+
+	vs_state=$("$JQ" -r '.state' <<< "$vs_json")
+	if [[ -z "$vs_state" || "$vs_state" != "POWERED_OFF" ]]; then
+		die "VSphere state ${vs_guest} not off"
+	fi
+
+	# terminate vSphere session
+	if ! vs_json=$(vs_curl DELETE "session" -H "vmware-api-session-id: ${vs_session}"); then
+		die "Failed to terminate vSphere API session for ${vs_guest}"
+	fi
+	# no need to check errors here
+}
+
+agent_ssh()
+{
+	SSH=${SSH:-/bin/ssh}
+
+	SSH_USER="${SSH_USER:-root}"
+	SSH_IDENTS="${SSH_IDENTS:-}"
+
+	SSH_ARGS="-o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -q -l $SSH_USER $SSH_IDENTS"
+
+	REMOTE_RID=
+	test $TEST && {
+		OUTPUT=$( "$SSH" "$1" -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -q -l "$SSH_USER" $SSH_IDENTS "echo REMOTE_RID=\"\$(echo @@_TEST_OK_@@)\"" )
+		ret=$?
+		if [ $ret -ne 0 ]; then
+			log "Unable to ssh to host \"$1\""
+			return $ret
+		fi
+		eval "$OUTPUT"
+		test "$REMOTE_RID" == "@@_TEST_OK_@@"
+		ret=$?
+		return $ret
+	}
+
+	OUTPUT=$( "$SSH" "$1" -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -q -l "$SSH_USER" $SSH_IDENTS "echo REMOTE_RID=\"\$(grep -slw ${RID} /sys/fs/scoutfs/*/rid | cut -d/ -f5)\"" )
+	ret=$?
+
+	if [ $ret -ne 0 ]; then
+		# ssh failed, power off host anyway
+		log "Unable to ssh to host \"$1\""
+		agent_ipmitool "$@"
+	fi
+	eval "$OUTPUT"
+	if [ -z "$REMOTE_RID" ]; then
+		# remote rid no longer mounted
+		log "RID ${RID} no longer mounted on remote host \"$1\""
+		exit 0
+	fi
+
+	# power off the node
+	agent_ipmitool "$1"
+}
+
+fence_remote_ip()
+{
+	#
+	# check if the host is listed in the ipmi hosts config file
+	# where we can find out how to do a remote shutdown using
+	# BMC infrastructure
+	#
+	read -r -a HOSTCONF < <(grep -s "^${IP}[[:space:]]" "$IPMI_HOSTS")
+	if [ -z "${HOSTCONF[0]}" ]; then
+		#
+		# no entries at all, assume SSH (no IPMI)
+		#
+		agent_ssh "$IP"
+	fi
+
+	case ${HOSTCONF[1]} in
+	ipmitool)
+		agent_ipmitool "${HOSTCONF[2]}"
+		;;
+	powerman)
+		agent_powerman "${HOSTCONF[2]}"
+		;;
+	vsphere)
+		agent_vsphere "${HOSTCONF[2]}"
+		;;
+	ssh)
+		# this isn't in the current scripts, but, it's obvious
+		# enough and may be useful in some non-IPMI setups
+		# that could help someone deploy.
+		agent_ssh "${HOSTCONF[2]}"
+		;;
+	*)
+		#
+		# backwards compatibility: The old IPMI hosts file format only had
+		# 2 fields, not 3
+		#
+		if [ -z "${HOSTCONF[2]}" ]; then
+			# old format
+			agent_ipmitool "${HOSTCONF[1]}"
+		else
+			# can't parse
+			die "incompatible ${IPMI_HOSTS} file: entry \"${HOSTCONF[*]}\""
+		fi
+		;;
+	esac
+}
+
+get_fence_origin()
+{
+	# $1 - ${RID} of incoming fence target
+	FENCE_SOURCE=$(grep -slw "${1}" /sys/fs/scoutfs/*/fence/rid)
+	basename "$(dirname "$(dirname "${FENCE_SOURCE}")")"
+}
+
+get_quorum_slot()
+{
+	# $1 - f.*.r.* ident
+	cat "/sys/fs/scoutfs/${1}/mount_options/quorum_slot_nr"
+}
+
+get_ip_for_quorum_slot()
+{
+	# $1 - f.*.r.* ident
+	# $2 - quorum slot number
+
+	# this is pretty heavy-handed. We could expose IP/PORT information of each
+	# mount in sysfs to make this a lot easier on the system, instead of dumping
+	# the device
+	scoutfs print "$(cat "/sys/fs/scoutfs/${1}/mount_options/metadev_path")" | head -n 100 | awk -F: "\$1~/quorum slot[ ]+${A}/ {print \$2}"
+}
+
+do_local_poweroff()
+{
+	wall "Scoutfs fence agent is shutting down this node immediately".
+	poweroff
+	#XXX todo: maybe `(sleep 20 ; poweroff -f) &` instead, or, additionally?
+}
+
+do_test()
+{
+	log "Test mode: verifying connection to manage all known nodes."
+	fail=0
+
+	# do a little `mapfile` dance to avoid pipes, since that spawns a subshell
+	# and then we can't set `$fail` inside the loop, and be persistent outside
+	# of it.
+	mapfile LINES <<< $(awk '!/^($|[[:space:]]*#)/ {print}' "$IPMI_HOSTS")
+	for l in `seq 0 ${#LINES[@]}`; do
+		read -r -a HOSTCONF <<< "${LINES[$l]}"
+
+		if [[ -z "${HOSTCONF[0]}" ]]; then
+			continue
+		fi
+
+		# test direct SSH first
+		case ${HOSTCONF[1]} in
+		ipmitool|powerman|vsphere)
+			agent_ssh "${HOSTCONF[0]}"
+			ret=$?
+			;;
+		esac
+		if [ $ret -eq 0 ]; then
+			log " ✓ PASS\t\t${HOSTCONF[0]} (ssh)"
+		else
+			log " ✗ FAIL\t\t${HOSTCONF[0]} (ssh)"
+			export fail=1
+		fi
+
+		case ${HOSTCONF[1]} in
+		ipmitool)
+			agent_ipmitool "${HOSTCONF[2]}"
+			ret=$?
+			;;		
+		powerman)
+			agent_powerman "${HOSTCONF[2]}"
+			ret=$?
+			;;		
+		vsphere)
+			agent_vsphere "${HOSTCONF[2]}"
+			ret=$?
+			;;		
+		ssh)
+			agent_ssh "${HOSTCONF[2]}"
+			ret=$?
+			;;
+		*)
+			# old style config file
+			agent_ipmitool ${HOSTCONF[1]}
+			ret=$?
+			;;		
+		esac
+		if [ $ret -eq 0 ]; then
+			log " ✓ PASS\t\t${HOSTCONF[0]} (${HOSTCONF[1]})"
+		else
+			log " ✗ FAIL\t\t${HOSTCONF[0]} (${HOSTCONF[1]})"
+			export fail=1
+		fi
+	done
+
+	test $fail -eq 1 && die "Test mode failed."
+	exit 0
+}
+
+#
+# External data passed to us:
+#
+# argv[1/2/3] are based on configuration (and entirely unused)
+
+if [ -z "$SCOUTFS_FENCED_REQ_RID" -o -n "$IPMI_TEST" ]; then
+	export TEST=1
+	do_test
+fi
+
+# ENV Variables set by ScoutFS when fencing host
+export IP="$SCOUTFS_FENCED_REQ_IP"
+export RID="$SCOUTFS_FENCED_REQ_RID"
+
+#
+# Determine if this is a local mount, or remote
+#
+FENCE=$(grep -swl "${RID}" /sys/fs/scoutfs/f.*.r*/rid)
+if [ -n "${FENCE}" ]; then
+	# the fence target is local, and active
+	fence_local_mount
+else
+	# we didn't find a local mount, but it could have still been
+	# a local IP, but it's already gone, or dead. We shouldn't
+	# force shutdown the address if it's not remote. Make sure
+	# before proceeding that that is not the case here.
+	ORIGIN=$(get_fence_origin "${RID}")
+	# todo: could have been passed in from scoutfs-fenced to save some time
+
+	ORIGIN_QUORUM_SLOT=$(get_quorum_slot "${ORIGIN}")
+	# todo: validate the slot number is real
+
+	ORIGIN_IP=$(get_ip_for_quorum_slot "${ORIGIN}" "${ORIGIN_QUORUM_SLOT}")
+	# todo: validate
+
+	if [ "${IP}" = "${ORIGIN_IP}" ]; then
+		#
+		# the fence request is for itself
+		#
+		# We're now in the situation where we should fence a local node
+		# but we can't identify if this is an active mount, since there
+		# is no node folder in sysfs.
+		do_local_poweroff
+	fi
+
+	# seems properly remote. OK to proceed to remote fence.
+	fence_remote_ip
+fi

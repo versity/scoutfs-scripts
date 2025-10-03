@@ -1,77 +1,65 @@
+
 # Introduction #
 
-The scripts in this directory are useful for environments that require fencing actions.
+This script dispatches fence requests from the scoutfs quorum nodes.
 
-The `ipmi-remote-host` and `fence-remote-host` scripts cannot be run simultaneously. The `ipmi-remote-host` script is for environments that allow direct IPMI access to the BMC of all nodes that mount the ScoutFS filesystem. The `fence-remote-host` script is for environments that have one or more different node access types including IPMI, Powerman, and vSphere.
+All scoutfs installations require fencing to be setup. Including single
+node systems.
 
-# `ipmi-remote-host` #
+It supports fencing nodes using SSH, ipmitool, powerman, or VSphere,
+depending on the configuration used.
 
-The `ipmi-remote-host` script is the default fencing script for ScoutFS for environments that have all bare-metal nodes with direct IPMI access to all nodes BMC devices.
+Documentation for the script, configuration,
+and operations is available at [ScoutFS
+Fencing](https://docs.versity.com/docs/scoutfs-fencing).
 
-Documentation for `ipmi-remote-host` script, configuration, and operations is available at [ScoutFS Fencing](https://docs.versity.com/docs/scoutfs-fencing).
+This script must be installed on ALL active quorum nodes, so make sure
+to repeat the full installation instructions on every node.
 
-# `fence-single-node` #
-
-The `fence-single-node` is a simplified fencing script for ScoutAM instances with single nodes. The script essentially checks to see if the filesystem is mounted on the node. If it is not, the fencing request is cleared correctly.
-
-## Installation ##
-
-Steps for installing the `fence-single-node` script:
-
-1. Download the `fence-single-node` script from this repository
-2. Copy to `/usr/libexec/scoutfs-fenced/run/fence-single-node`
-3. Make executable `chmod 700 /usr/libexec/scoutfs-fenced/run/fence-single-node`
-4. Edit `/etc/scoutfs/scoutfs-fenced.conf` and set `SCOUTFS_FENCED_RUN=/usr/libexec/scoutfs-fenced/run/fence-single-node`
-5. Enable and start the ScoutFS fencing service `systemctl enable scoutfs-fenced ; systemctl start scoutfs-fenced`
-
-# `fence-remote-host` #
-
-The `fence-remote-host` script supports direct IPMI, indirect IPMI using `powerman`, and VM environments with vSphere.
-
-## Usage ##
-
-```
-Usage: fence-remote-host [-h|--help] [-C|--config file] [-H|--hosts file] [-d|--debug] [-v|--verbose] [-t|--test] | -i|--ip IP -r|--rid RID
-```
 
 ## Installation ##
 
-The `fence-remote-host` script is typically installed in the directory `/usr/libexec/scoutfs-fenced/run`.
+Steps for installing the script:
 
-The script MUST be installed on all ScoutFS quorum nodes.
+ 1. Download a copy of this repository.
+ 2. Execute `sudo make install` in from within the `fence` subfolder
+ 3. Edit `/etc/scoutfs/scoutfs-fenced.conf` and set `SCOUTFS_FENCED_RUN=/usr/libexec/scoutfs-fenced/run/fence-single-node`
+ 4. Add all nodes to `/etc/scoutfs/scoutfs-ipmi-hosts.conf`
+ 5. Enable and start the ScoutFS fencing service `systemctl enable scoutfs-fenced ; systemctl start scoutfs-fenced`
+
+Repeat on every node.
+
+
+## Testing Configuration ##
+
+The fencing configuration can be tested by executing the script directly:
 
 ```bash
-mkdir -p /usr/libexec/scoutfs-fenced/run
-cp fence-remote-host /usr/libexec/scoutfs-fenced/run/
-chmod +x /usr/libexec/scoutfs-fenced/run/fence-remote-host
-```
-
-### Testing Configuration ###
-
-The fencing configuration can be tested using the following command:
-
-```bash
-/usr/libexec/scoutfs-fenced/run/fence-remote-host --test
+/usr/libexec/scoutfs-fenced/run/fence-remote-host
 ```
 Example output:
 
 ```
-PASS - SSH to 10.0.0.100
-FAIL - powerman power state for 10.0.0.100 from v1
-PASS - powerman power state for 10.0.0.100 from 172.21.1.51
-PASS - SSH to 10.0.0.101
-FAIL - powerman power state for 10.0.0.101 from v1
-PASS - powerman power state for 10.0.0.101 from 172.21.1.51
-PASS - SSH to 10.0.0.102
-FAIL - powerman power state for 10.0.0.102 from v1
-PASS - powerman power state for 10.0.0.102 from 172.21.1.51
+Test mode: verifying connection to manage all known nodes.
+ ✗	node1 (ipmitool): FAIL
+Error: Unable to establish IPMI v2 / RMCP+ session
+Error: `/bin/ipmitool -R 1 -I lanplus  -U admin -P password  -H "127.0.0.1" chassis power status` returned (1): ""
+ ✓      node2 (powerman): PASS
+ ✓      node3 (powerman): PASS
+Test mode failed.
 ```
 
-In the above output the script is testing for passwordless SSH connectivity and checking power state using `powerman`. Note that the `powerman` mode does support multiple Powerman servers for redundancy. For this example the Powerman server `v1` was not responding, but the power state for each node was verified from the Powerman server `172.21.1.51`.
+The script will test connectivity to the configured control or
+management plane and succeed if that works. Any errors encountered
+during the testing will be shown to help diagnose configuration errors.
+
 
 ## Passwordless SSH Considerations ##
 
-The `fence-remote-host` script still requires passwordless SSH between all nodes that mount the ScoutFS filesystem but adds the ability to use non-root identities. If using a non-root user, the following parameters can be added to the `/etc/scoutfs/scoutfs-ipmi.conf` configuration file:
+The script can utilize passwordless SSH between all nodes that
+mount the ScoutFS filesystem but adds the ability to use non-root
+identities. If using a non-root user, the following parameters can
+be added to the `/etc/scoutfs/scoutfs-ipmi.conf` configuration file:
 
 ```
 SSH_USER=user
