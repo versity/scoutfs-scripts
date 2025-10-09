@@ -28,6 +28,7 @@ IPMI_HOSTS=${IPMI_HOSTS:-/etc/scoutfs/scoutfs-ipmi-hosts.conf}
 # early checks
 test -r "$IPMI_CONFIG" || die "Missing or unreadable \"$IPMI_CONFIG\" file"
 test -r "$IPMI_HOSTS" || die "Missing or unreadable \"$IPMI_HOSTS\" file"
+type scoutfs > /dev/null 2>&1 || die "Missing \"scoutfs\" cli command executable"
 
 fence_local_mount()
 {
@@ -457,15 +458,15 @@ do_test()
 		ipmitool)
 			agent_ipmitool "${HOSTCONF[2]}"
 			ret=$?
-			;;		
+			;;
 		powerman)
 			agent_powerman "${HOSTCONF[2]}"
 			ret=$?
-			;;		
+			;;
 		vsphere)
 			agent_vsphere "${HOSTCONF[2]}"
 			ret=$?
-			;;		
+			;;
 		ssh)
 			agent_ssh "${HOSTCONF[2]}"
 			ret=$?
@@ -474,7 +475,7 @@ do_test()
 			# old style config file
 			agent_ipmitool ${HOSTCONF[1]}
 			ret=$?
-			;;		
+			;;
 		esac
 		if [ $ret -eq 0 ]; then
 			log " ✓ PASS\t\t${HOSTCONF[0]} (${HOSTCONF[1]})"
@@ -505,34 +506,11 @@ export RID="$SCOUTFS_FENCED_REQ_RID"
 #
 # Determine if this is a local mount, or remote
 #
+set -x
 FENCE=$(grep -swl "${RID}" /sys/fs/scoutfs/f.*.r*/rid)
 if [ -n "${FENCE}" ]; then
 	# the fence target is local, and active
 	fence_local_mount
 else
-	# we didn't find a local mount, but it could have still been
-	# a local IP, but it's already gone, or dead. We shouldn't
-	# force shutdown the address if it's not remote. Make sure
-	# before proceeding that that is not the case here.
-	ORIGIN=$(get_fence_origin "${RID}")
-	# todo: could have been passed in from scoutfs-fenced to save some time
-
-	ORIGIN_QUORUM_SLOT=$(get_quorum_slot "${ORIGIN}")
-	# todo: validate the slot number is real
-
-	ORIGIN_IP=$(get_ip_for_quorum_slot "${ORIGIN}" "${ORIGIN_QUORUM_SLOT}")
-	# todo: validate
-
-	if [ "${IP}" = "${ORIGIN_IP}" ]; then
-		#
-		# the fence request is for itself
-		#
-		# We're now in the situation where we should fence a local node
-		# but we can't identify if this is an active mount, since there
-		# is no node folder in sysfs.
-		do_local_poweroff
-	fi
-
-	# seems properly remote. OK to proceed to remote fence.
 	fence_remote_ip
 fi
