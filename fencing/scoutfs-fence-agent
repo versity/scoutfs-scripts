@@ -331,9 +331,9 @@ agent_ssh()
 	ret=$?
 
 	if [ $ret -ne 0 ]; then
-		# ssh failed, power off host anyway
+		# an error happened. Return it to the caller.
 		log "Unable to ssh to host \"$1\""
-		agent_ipmitool "$@"
+		return $ret
 	fi
 	eval "$OUTPUT"
 	if [ -z "$REMOTE_RID" ]; then
@@ -342,8 +342,43 @@ agent_ssh()
 		exit 0
 	fi
 
-	# power off the node
-	agent_ipmitool "$1"
+	# Do not power off the node here. Return an error value so the caller
+	# can proceed to power down the node in the correct way.
+	return 1
+}
+
+ssh_remote_powerdown()
+{
+	#
+	# SSH powerdown isn't something supported in previous versions, but it's
+	# trivial and possible if the host still responds to SSH requests, and,
+	# in most 'hung' scoutfs cases, this is the norm.
+	#
+
+	SSH=${SSH:-/bin/ssh}
+
+	SSH_USER="${SSH_USER:-root}"
+	SSH_IDENTS="${SSH_IDENTS:-}"
+
+	SSH_ARGS="-o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -q -l $SSH_USER $SSH_IDENTS"
+
+	OUTPUT=$( "$SSH" "$1" -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -q -l "$SSH_USER" $SSH_IDENTS "poweroff -f" )
+	ret=$?
+
+	if [ $ret -ne 0 ]; then
+		# an error happened. Return it to the caller.
+		log "Unable to ssh to host \"$1\""
+		return $ret
+	fi
+
+	#XXX test and handle OUTPUT.
+	if [[ "$OUTPUT" == "Powering off." ]]; then
+		exit 0
+	fi
+
+	# Something else happened.
+	log "Ssh remote poweroff returned: \"$OUTPUT\""
+	return 1
 }
 
 fence_remote_ip()
@@ -356,10 +391,23 @@ fence_remote_ip()
 	read -r -a HOSTCONF < <(grep -s "^${IP}[[:space:]]" "$IPMI_HOSTS")
 	if [ -z "${HOSTCONF[0]}" ]; then
 		#
-		# no entries at all, assume SSH (no IPMI)
+		# no entries at all, assume SSH (no IPMI) XXX not documented
 		#
 		agent_ssh "$IP"
 	fi
+
+	case ${HOSTCONF[1]} in
+	ipmitool|powerman|vsphere)
+		#
+		# A fence request came for a remote host, but, it's possible that
+		# the request came for e.g. an old quorum leader. In that case,
+		# we can and should look if the RID is mounted on the remote
+		# host. If it isn't, the fence request is complete, and we can exit.
+		# If it is, we want to power down the remote node.
+		#
+		agent_ssh "$IP"
+		;;
+	esac
 
 	case ${HOSTCONF[1]} in
 	ipmitool)
