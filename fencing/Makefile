@@ -14,6 +14,9 @@ SCOUTFS_FENCED_RUN_DIR := ${PREFIX}/$(LIBEXEC)/scoutfs-fenced/run
 all:
 	# nop
 
+check:
+	shellcheck scoutfs-fence-agent
+
 install:
 	install -d $(DESTDIR)$(SCOUTFS_FENCED_RUN_DIR)
 	install -m0755 scoutfs-fence-agent $(DESTDIR)$(SCOUTFS_FENCED_RUN_DIR)/

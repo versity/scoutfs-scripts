@@ -91,7 +91,7 @@ agent_ipmitool()
 	fi
 
 	# in test mode, just check that ipmitool can fetch the power status
-	test $TEST && {
+	test "$TEST" && {
 		OUTPUT=$($IPMITOOL_CMD $IPMI_ARGS $HOSTARG chassis power status)
 		ret=$?
 		if [ $ret -ne 0 ]; then
@@ -170,7 +170,7 @@ agent_powerman()
 	POWERMAN="${POWERMAN:-/bin/pm}"
 	POWERMAN_PORT="${POWERMAN_PORT:-10101}"
 
-	test $TEST && {
+	test "$TEST" && {
 		# all the powerman servers must be reachable to pass testing
 		fail=0
 		for s in "${pm_server[@]}"; do
@@ -272,7 +272,7 @@ agent_vsphere()
 	# no errors, trim to obtain session
 	vs_session=$(tr -d '"' <<< "$vs_json")
 
-	test ! $TEST && {
+	test "$TEST" || {
 		# send power off
 		if ! vs_json=$(vs_curl POST "vcenter/vm/${vs_guest}/power?action=stop" -H "vmware-api-session-id: ${vs_session}") ; then
 			die "VSphere power off ${vs_guest} failed"
@@ -290,7 +290,7 @@ agent_vsphere()
 
 	# vsphere testing will die on any error at this point, so, assume this is
 	# sufficient testing for now.
-	test $TEST && { return 0; }
+	test "$TEST" && { return 0; }
 
 	vs_state=$("$JQ" -r '.state' <<< "$vs_json")
 	if [[ -z "$vs_state" || "$vs_state" != "POWERED_OFF" ]]; then
@@ -311,10 +311,8 @@ agent_ssh()
 	SSH_USER="${SSH_USER:-root}"
 	SSH_IDENTS="${SSH_IDENTS:-}"
 
-	SSH_ARGS="-o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -q -l $SSH_USER $SSH_IDENTS"
-
 	REMOTE_RID=
-	test $TEST && {
+	test "$TEST" && {
 		OUTPUT=$( "$SSH" "$1" -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -q -l "$SSH_USER" $SSH_IDENTS "echo REMOTE_RID=\"\$(echo @@_TEST_OK_@@)\"" )
 		ret=$?
 		if [ $ret -ne 0 ]; then
@@ -359,8 +357,6 @@ ssh_remote_powerdown()
 
 	SSH_USER="${SSH_USER:-root}"
 	SSH_IDENTS="${SSH_IDENTS:-}"
-
-	SSH_ARGS="-o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -q -l $SSH_USER $SSH_IDENTS"
 
 	OUTPUT=$( "$SSH" "$1" -o ConnectTimeout=3 -o BatchMode=yes -o StrictHostKeyChecking=no -q -l "$SSH_USER" $SSH_IDENTS "poweroff -f" )
 	ret=$?
@@ -480,8 +476,8 @@ do_test()
 	# do a little `mapfile` dance to avoid pipes, since that spawns a subshell
 	# and then we can't set `$fail` inside the loop, and be persistent outside
 	# of it.
-	mapfile LINES <<< $(awk '!/^($|[[:space:]]*#)/ {print}' "$IPMI_HOSTS")
-	for l in `seq 0 ${#LINES[@]}`; do
+	mapfile LINES <<< "$(awk '!/^($|[[:space:]]*#)/ {print}' "$IPMI_HOSTS")"
+	for l in $(seq 0 ${#LINES[@]}); do
 		read -r -a HOSTCONF <<< "${LINES[$l]}"
 
 		if [[ -z "${HOSTCONF[0]}" ]]; then
@@ -542,7 +538,7 @@ do_test()
 #
 # argv[1/2/3] are based on configuration (and entirely unused)
 
-if [ -z "$SCOUTFS_FENCED_REQ_RID" -o -n "$IPMI_TEST" ]; then
+if [ -z "$SCOUTFS_FENCED_REQ_RID" ] || [ -n "$IPMI_TEST" ]; then
 	export TEST=1
 	do_test
 fi
