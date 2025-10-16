@@ -28,10 +28,13 @@ IPMI_HOSTS=${IPMI_HOSTS:-/etc/scoutfs/scoutfs-ipmi-hosts.conf}
 # early checks
 test -r "$IPMI_CONFIG" || die "Missing or unreadable \"$IPMI_CONFIG\" file"
 test -r "$IPMI_HOSTS" || die "Missing or unreadable \"$IPMI_HOSTS\" file"
-type scoutfs > /dev/null 2>&1 || die "Missing \"scoutfs\" cli command executable"
 
 fence_local_mount()
 {
+	#
+	# this is the local single-node equivalent of how fencing is done
+	# during the scoutfs tests.
+	#
 	FS_RID=$(grep -slw "${RID}" /sys/fs/scoutfs/*/rid | cut -d/ -f5)
 	if [ -z "${FS_RID}" ]; then
 		#
@@ -367,7 +370,7 @@ ssh_remote_powerdown()
 		return $ret
 	fi
 
-	#XXX test and handle OUTPUT.
+	# test and handle OUTPUT.
 	if [[ "$OUTPUT" == "Powering off." ]]; then
 		exit 0
 	fi
@@ -389,7 +392,11 @@ fence_remote_ip()
 		#
 		# no entries at all, assume SSH (no IPMI) XXX not documented
 		#
+		# Since there's no known ipmi config here, if we can SSH to
+		# the IP, check for mount and power down.
 		agent_ssh "$IP"
+		ssh_remote_powerdown "$IP"
+		die "Unable to fence \"$IP\"."
 	fi
 
 	case ${HOSTCONF[1]} in
@@ -399,7 +406,7 @@ fence_remote_ip()
 		# the request came for e.g. an old quorum leader. In that case,
 		# we can and should look if the RID is mounted on the remote
 		# host. If it isn't, the fence request is complete, and we can exit.
-		# If it is, we want to power down the remote node.
+		# If it is active, we want to power down the remote node.
 		#
 		agent_ssh "$IP"
 		;;
@@ -416,15 +423,18 @@ fence_remote_ip()
 		agent_vsphere "${HOSTCONF[2]}"
 		;;
 	ssh)
-		# this isn't in the current scripts, but, it's obvious
-		# enough and may be useful in some non-IPMI setups
-		# that could help someone deploy.
+		# if the type string is SSH, assume the third row is the IP
+		# that can be used for mgmt access, and is different from the
+		# first field.
 		agent_ssh "${HOSTCONF[2]}"
+		ssh_remote_powerdown "$IP"
+		die "Unable to fence \"$IP\"."
 		;;
 	*)
 		#
 		# backwards compatibility: The old IPMI hosts file format only had
-		# 2 fields, not 3
+		# 2 fields, not 3. If there's only 2 fields, the 2nd field is the
+		# IPMI target address for the BMC of the IP.
 		#
 		if [ -z "${HOSTCONF[2]}" ]; then
 			# old format
@@ -435,30 +445,8 @@ fence_remote_ip()
 		fi
 		;;
 	esac
-}
 
-get_fence_origin()
-{
-	# $1 - ${RID} of incoming fence target
-	FENCE_SOURCE=$(grep -slw "${1}" /sys/fs/scoutfs/*/fence/rid)
-	basename "$(dirname "$(dirname "${FENCE_SOURCE}")")"
-}
-
-get_quorum_slot()
-{
-	# $1 - f.*.r.* ident
-	cat "/sys/fs/scoutfs/${1}/mount_options/quorum_slot_nr"
-}
-
-get_ip_for_quorum_slot()
-{
-	# $1 - f.*.r.* ident
-	# $2 - quorum slot number
-
-	# this is pretty heavy-handed. We could expose IP/PORT information of each
-	# mount in sysfs to make this a lot easier on the system, instead of dumping
-	# the device
-	scoutfs print "$(cat "/sys/fs/scoutfs/${1}/mount_options/metadev_path")" | head -n 100 | awk -F: "\$1~/quorum slot[ ]+${A}/ {print \$2}"
+	die "Unable to fence \"$IP\"."
 }
 
 do_local_poweroff()
@@ -480,6 +468,7 @@ do_test()
 	for l in $(seq 0 ${#LINES[@]}); do
 		read -r -a HOSTCONF <<< "${LINES[$l]}"
 
+		# avoid parsing empty lines or comments
 		if [[ -z "${HOSTCONF[0]}" ]]; then
 			continue
 		fi
@@ -491,7 +480,7 @@ do_test()
 			ret=$?
 			;;
 		esac
-		if [ $ret -eq 0 ]; then
+		if [ "$ret" -eq 0 ]; then
 			log " ✓ PASS\t\t${HOSTCONF[0]} (ssh)"
 		else
 			log " ✗ FAIL\t\t${HOSTCONF[0]} (ssh)"
@@ -517,7 +506,7 @@ do_test()
 			;;
 		*)
 			# old style config file
-			agent_ipmitool ${HOSTCONF[1]}
+			agent_ipmitool "${HOSTCONF[1]}"
 			ret=$?
 			;;
 		esac
@@ -544,17 +533,19 @@ if [ -z "$SCOUTFS_FENCED_REQ_RID" ] || [ -n "$IPMI_TEST" ]; then
 fi
 
 # ENV Variables set by ScoutFS when fencing host
+# shellcheck disable=SC2153
 export IP="$SCOUTFS_FENCED_REQ_IP"
+# shellcheck disable=SC2153
 export RID="$SCOUTFS_FENCED_REQ_RID"
 
 #
 # Determine if this is a local mount, or remote
 #
-set -x
 FENCE=$(grep -swl "${RID}" /sys/fs/scoutfs/f.*.r*/rid)
 if [ -n "${FENCE}" ]; then
 	# the fence target is local, and active
 	fence_local_mount
 else
+	# not local or mounted, process based on IP address
 	fence_remote_ip
 fi
