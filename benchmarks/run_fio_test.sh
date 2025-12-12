@@ -196,6 +196,291 @@ drop_caches() {
     fi
 }
 
+# Function to get device tunables from /sys/block
+# Usage: get_device_tunables <device_name>
+# Returns: max_sectors_kb scheduler nr_requests read_ahead_kb (space-separated)
+get_device_tunables() {
+    local dev="$1"
+    local sysfs="/sys/block/$dev/queue"
+    local max_sectors scheduler nr_requests read_ahead
+
+    if [[ -d "$sysfs" ]]; then
+        max_sectors=$(cat "$sysfs/max_sectors_kb" 2>/dev/null || echo "?")
+        # Extract active scheduler (the one in brackets, or the whole value if no brackets)
+        local sched_raw=$(cat "$sysfs/scheduler" 2>/dev/null)
+        if [[ "$sched_raw" =~ \[([^\]]+)\] ]]; then
+            scheduler="${BASH_REMATCH[1]}"
+        else
+            scheduler="${sched_raw:-?}"
+        fi
+        nr_requests=$(cat "$sysfs/nr_requests" 2>/dev/null || echo "?")
+        read_ahead=$(cat "$sysfs/read_ahead_kb" 2>/dev/null || echo "?")
+    else
+        max_sectors="?" scheduler="?" nr_requests="?" read_ahead="?"
+    fi
+    echo "$max_sectors $scheduler $nr_requests $read_ahead"
+}
+
+# Function to get slave devices from /sys/block
+# Usage: get_device_slaves <device_name>
+# Returns: space-separated list of slave device names
+get_device_slaves() {
+    local dev="$1"
+    local slaves_dir="/sys/block/$dev/slaves"
+
+    if [[ -d "$slaves_dir" ]]; then
+        ls "$slaves_dir" 2>/dev/null | sort
+    fi
+}
+
+# Function to classify device type
+# Usage: classify_device <device_name>
+# Returns: md, dm, sd, nvme, loop, or unknown
+classify_device() {
+    local dev="$1"
+    case "$dev" in
+        md*) echo "md" ;;
+        dm-*) echo "dm" ;;
+        sd*) echo "sd" ;;
+        nvme*) echo "nvme" ;;
+        loop*) echo "loop" ;;
+        *) echo "unknown" ;;
+    esac
+}
+
+# Function to find the most common value in an array and list deviations
+# Usage: summarize_values <values_string> <devices_string>
+# Input: space-separated values and corresponding device names
+# Returns: "common_value" or "common_value (deviations: dev1=val1, dev2=val2)"
+summarize_values() {
+    local values="$1"
+    local devices="$2"
+
+    # Convert to arrays
+    local -a val_arr=(${values})
+    local -a dev_arr=(${devices})
+
+    # Count occurrences
+    declare -A counts
+    for v in "${val_arr[@]}"; do
+        ((counts["$v"]++))
+    done
+
+    # Find most common
+    local most_common=""
+    local max_count=0
+    for v in "${!counts[@]}"; do
+        if [[ ${counts["$v"]} -gt $max_count ]]; then
+            max_count=${counts["$v"]}
+            most_common="$v"
+        fi
+    done
+
+    # Find deviations
+    local deviations=""
+    local i=0
+    for v in "${val_arr[@]}"; do
+        if [[ "$v" != "$most_common" ]]; then
+            if [[ -n "$deviations" ]]; then
+                deviations+=", "
+            fi
+            deviations+="${dev_arr[$i]}=$v"
+        fi
+        ((i++))
+    done
+
+    if [[ -n "$deviations" ]]; then
+        echo "$most_common ($deviations)"
+    else
+        echo "$most_common"
+    fi
+}
+
+# Function to collect and summarize tunables for a device group
+# Usage: summarize_device_group <device_type> <device_list>
+# Prints: summary line with tunables
+summarize_device_group() {
+    local dev_type="$1"
+    shift
+    local -a devices=("$@")
+    local count=${#devices[@]}
+
+    if [[ $count -eq 0 ]]; then
+        return
+    fi
+
+    local max_sectors_vals="" sched_vals="" nr_req_vals="" read_ahead_vals=""
+    local dev_names=""
+
+    for dev in "${devices[@]}"; do
+        local tunables=$(get_device_tunables "$dev")
+        local ms sched nr ra
+        read ms sched nr ra <<< "$tunables"
+
+        max_sectors_vals+="$ms "
+        sched_vals+="$sched "
+        nr_req_vals+="$nr "
+        read_ahead_vals+="$ra "
+        dev_names+="$dev "
+    done
+
+    # Summarize each tunable
+    local ms_summary=$(summarize_values "$max_sectors_vals" "$dev_names")
+    local sched_summary=$(summarize_values "$sched_vals" "$dev_names")
+    local nr_summary=$(summarize_values "$nr_req_vals" "$dev_names")
+    local ra_summary=$(summarize_values "$read_ahead_vals" "$dev_names")
+
+    # Format output
+    local label
+    case "$dev_type" in
+        md) label="MD" ;;
+        dm) label="DM" ;;
+        sd) label="SD" ;;
+        nvme) label="NVMe" ;;
+        loop) label="Loop" ;;
+        *) label="$dev_type" ;;
+    esac
+
+    if [[ $count -eq 1 ]]; then
+        echo "    ${devices[0]}: max_sectors=$ms_summary, sched=$sched_summary, nr_req=$nr_summary, read_ahead=$ra_summary"
+    else
+        echo "    $label Devices ($count): max_sectors=$ms_summary, sched=$sched_summary, nr_req=$nr_summary, read_ahead=$ra_summary"
+    fi
+}
+
+# Global arrays for device collection (avoids nameref issues in recursion)
+declare -a COLLECTED_MD=()
+declare -a COLLECTED_DM=()
+declare -a COLLECTED_SD=()
+declare -a COLLECTED_OTHER=()
+
+# Function to recursively collect all devices in the hierarchy
+# Usage: collect_device_hierarchy <start_device>
+# Populates global arrays: COLLECTED_MD, COLLECTED_DM, COLLECTED_SD, COLLECTED_OTHER
+collect_device_hierarchy() {
+    local start_dev="$1"
+
+    local dev_type=$(classify_device "$start_dev")
+    case "$dev_type" in
+        md) COLLECTED_MD+=("$start_dev") ;;
+        dm) COLLECTED_DM+=("$start_dev") ;;
+        sd|nvme) COLLECTED_SD+=("$start_dev") ;;
+        *) COLLECTED_OTHER+=("$start_dev") ;;
+    esac
+
+    # Recurse into slaves
+    local slaves=$(get_device_slaves "$start_dev")
+    for slave in $slaves; do
+        collect_device_hierarchy "$slave"
+    done
+}
+
+# Function to reset collection arrays
+reset_device_collection() {
+    COLLECTED_MD=()
+    COLLECTED_DM=()
+    COLLECTED_SD=()
+    COLLECTED_OTHER=()
+}
+
+# Function to print storage tunables
+# Prints mount info and device hierarchy tunables
+print_storage_tunables() {
+    # Get mount point from directory
+    local mount_point=$(stat -c '%m' "$DIR" 2>/dev/null)
+    if [[ -z "$mount_point" ]]; then
+        echo "Storage Configuration:"
+        echo "  (Could not determine mount point)"
+        echo ""
+        return
+    fi
+
+    # Get mount info from /proc/mounts
+    local mount_line=$(grep "^[^ ]* $mount_point " /proc/mounts 2>/dev/null | head -1)
+    if [[ -z "$mount_line" ]]; then
+        echo "Storage Configuration:"
+        echo "  Mount: $mount_point (not found in /proc/mounts)"
+        echo ""
+        return
+    fi
+
+    local data_dev=$(echo "$mount_line" | awk '{print $1}')
+    local fs_type=$(echo "$mount_line" | awk '{print $3}')
+    local mount_opts=$(echo "$mount_line" | awk '{print $4}')
+
+    # Extract metadev_path if present (ScoutFS specific)
+    local meta_dev=""
+    if [[ "$mount_opts" =~ metadev_path=([^,]+) ]]; then
+        meta_dev="${BASH_REMATCH[1]}"
+    fi
+
+    echo "Storage Configuration:"
+    echo "  Mount: $mount_point ($fs_type)"
+
+    # Print abbreviated mount options (first 80 chars + ...)
+    if [[ ${#mount_opts} -gt 80 ]]; then
+        echo "  Mount Options: ${mount_opts:0:80}..."
+    else
+        echo "  Mount Options: $mount_opts"
+    fi
+    echo ""
+
+    # Get the base device name from path (e.g., /dev/md124 -> md124)
+    local data_dev_name=$(basename "$data_dev")
+
+    # Collect device hierarchy for data device
+    reset_device_collection
+    collect_device_hierarchy "$data_dev_name"
+
+    echo "  Data Device: $data_dev"
+    # Print MD devices individually (usually few)
+    for md in "${COLLECTED_MD[@]}"; do
+        local tunables=$(get_device_tunables "$md")
+        local ms sched nr ra
+        read ms sched nr ra <<< "$tunables"
+        echo "    $md: max_sectors=$ms, sched=$sched, nr_req=$nr, read_ahead=$ra"
+    done
+    # Summarize DM devices
+    if [[ ${#COLLECTED_DM[@]} -gt 0 ]]; then
+        summarize_device_group "dm" "${COLLECTED_DM[@]}"
+    fi
+    # Summarize physical devices
+    if [[ ${#COLLECTED_SD[@]} -gt 0 ]]; then
+        summarize_device_group "sd" "${COLLECTED_SD[@]}"
+    fi
+
+    # Process meta device if present
+    if [[ -n "$meta_dev" ]]; then
+        echo ""
+        local meta_dev_name=$(basename "$meta_dev")
+        # Resolve symlink if needed
+        if [[ -L "$meta_dev" ]]; then
+            meta_dev_name=$(basename "$(readlink -f "$meta_dev")")
+        fi
+
+        reset_device_collection
+        collect_device_hierarchy "$meta_dev_name"
+
+        echo "  Meta Device: $meta_dev"
+        # Print MD devices individually
+        for md in "${COLLECTED_MD[@]}"; do
+            local tunables=$(get_device_tunables "$md")
+            local ms sched nr ra
+            read ms sched nr ra <<< "$tunables"
+            echo "    $md: max_sectors=$ms, sched=$sched, nr_req=$nr, read_ahead=$ra"
+        done
+        # Summarize DM devices
+        if [[ ${#COLLECTED_DM[@]} -gt 0 ]]; then
+            summarize_device_group "dm" "${COLLECTED_DM[@]}"
+        fi
+        # Summarize physical devices
+        if [[ ${#COLLECTED_SD[@]} -gt 0 ]]; then
+            summarize_device_group "sd" "${COLLECTED_SD[@]}"
+        fi
+    fi
+    echo ""
+}
+
 # Function to create read files
 create_read_files() {
     local num_files=${1:-$FILES}  # Use parameter or default to FILES
@@ -532,12 +817,12 @@ print_summary() {
     echo "  Acct Age: $ACCT_AGE"
     echo "  Demand Stage Backoff: $DEMAND_BACKOFF"
     echo ""
+    print_storage_tunables
     echo "Test Parameters:"
     echo "  Operation: $OP"
     echo "  Directory: $DIR"
     if [[ "$OP" == "rw" ]]; then
-        echo "  Base Fil
-                        es: $FILES"
+        echo "  Base Files: $FILES"
         echo "  Write:Read Ratio: $RATIO"
         echo "  Write Files: $WRITE_FILES (${FILES} × ${WRITE_PART})"
         echo "  Read Files: $READ_FILES (${FILES} × ${READ_PART})"
