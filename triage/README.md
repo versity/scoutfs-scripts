@@ -1,4 +1,4 @@
-# collect-tape-diag.sh
+# collect-triage.sh
 
 Diagnostic collection script for troubleshooting slow tape write performance on ScoutFS/ScoutAM systems. Captures memory, I/O, CPU, kernel, and ScoutFS-specific metrics over a configurable duration.
 
@@ -6,16 +6,16 @@ Diagnostic collection script for troubleshooting slow tape write performance on 
 
 ```bash
 # Basic 60-second collection
-sudo ./collect-tape-diag.sh
+sudo ./collect-triage.sh
 
 # 5-minute collection, skip SOS report for speed
-sudo ./collect-tape-diag.sh --duration 300 --no-sos
+sudo ./collect-triage.sh --duration 300 --no-sos
 
 # With deep kernel tracing
-sudo ./collect-tape-diag.sh --trace --duration 120
+sudo ./collect-triage.sh --trace --duration 120
 
 # Auto-install missing utilities
-sudo ./collect-tape-diag.sh --install
+sudo ./collect-triage.sh --install
 ```
 
 ## Requirements
