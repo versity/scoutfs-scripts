@@ -111,6 +111,8 @@ OUTPUT:
     - scoutfs-trace.gz (if --trace enabled)
     - perf-top.log.gz (perf top output for duration)
     - debugfs-scoutfs.tar (ScoutFS debugfs tree snapshot)
+    - cpuinfo.txt (/proc/cpuinfo snapshot)
+    - samcli.txt (ScoutAM scheduler and catalog state)
     - sosreport-*.tar.xz (system diagnostic report, if sos is installed)
 EOF
     exit 0
@@ -300,12 +302,40 @@ get_scoutfs_debug_path() {
     return 1
 }
 
+collect_samcli() {
+    if ! command -v samcli >/dev/null 2>&1; then
+        echo "WARNING: samcli not found, skipping ScoutAM CLI collection"
+        return
+    fi
+
+    local output_file="$OUTPUT_DIR/samcli.txt"
+    echo "Collecting ScoutAM CLI data..."
+
+    echo "=== samcli scheduler ===" > "$output_file"
+    samcli scheduler >> "$output_file" 2>&1
+    echo "" >> "$output_file"
+
+    echo "=== samcli scheduler -d ===" >> "$output_file"
+    samcli scheduler -d >> "$output_file" 2>&1
+    echo "" >> "$output_file"
+
+    echo "=== samcli catalog ===" >> "$output_file"
+    samcli catalog >> "$output_file" 2>&1
+    echo "" >> "$output_file"
+
+    echo "=== samcli catalog pool ===" >> "$output_file"
+    samcli catalog pool >> "$output_file" 2>&1
+}
+
 # Collect start snapshots
 collect_start_snapshots() {
     echo "Collecting start snapshots..."
 
     # Memory info
     cat /proc/meminfo > "$OUTPUT_DIR/meminfo-start.txt" 2>&1
+
+    # CPU info
+    cat /proc/cpuinfo > "$OUTPUT_DIR/cpuinfo.txt" 2>&1
 
     # vmstat counters
     cat /proc/vmstat > "$OUTPUT_DIR/vmstat-start.txt" 2>&1
@@ -320,6 +350,9 @@ collect_start_snapshots() {
 
     # ScoutFS debugfs tree
     collect_debugfs_scoutfs
+
+    # ScoutAM CLI
+    collect_samcli
 
     # FC host statistics
     collect_fc_stats "$OUTPUT_DIR/fc-stats-start.txt"
