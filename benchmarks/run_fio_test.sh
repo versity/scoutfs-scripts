@@ -974,7 +974,7 @@ print_summary() {
         fi
     else
         # Single run - display results as before
-        if [[ ${#READ_RESULTS[@]} -gt 0 && -n "${READ_RESULTS[1]}" ]]; then
+        if [[ -n "${READ_RESULTS[1]}" || -n "${WRITE_RESULTS[1]}" ]]; then
             echo "Performance Results:"
             if [[ -n "${READ_RESULTS[1]}" ]]; then
                 echo "  ${READ_RESULTS[1]}"
