@@ -1,0 +1,23 @@
+name: "scoutfs-scripts"
+arch: "amd64"
+platform: "linux"
+version: "${VERSION}"
+section: "default"
+priority: "extra"
+provides:
+- scoutfs-scripts
+maintainer: "Versity <support@versity.com>"
+description: |
+  This includes various support scripts and extra documentation for advanced ScoutFS usage.
+vendor: "Versity, Inc."
+homepage: "http://versity.com"
+license: ""
+umask: 0o002
+#changelog: "changelog.yaml"
+contents:
+- src: /scoutfs-fencing/fence-remote-host
+  dst: /usr/libexec/scoutfs-fenced/run/fence-remote-host
+- src: /scoutfs-fencing/ipmi-remote-host
+  dst: /usr/libexec/scoutfs-fenced/run/ipmi-remote-host
+- src: /scoutfs-fencing/README.md
+  dst: /usr/libexec/scoutfs-fenced/run/README.md

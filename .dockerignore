@@ -1,0 +1,6 @@
+# .dockerignore
+
+*
+!fencing/
+!package.sh
+!nfpm.yaml
