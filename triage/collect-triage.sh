@@ -1,18 +1,20 @@
 #!/bin/bash
 #
-# collect-tape-diag.sh - Tape Performance Diagnostic Collection Script
+# collect-triage.sh - ScoutFS/ScoutAM Triage Collection Script
 #
-# Collects memory, I/O, CPU, and ScoutFS metrics to diagnose slow tape writes.
-# Focus: Page cache behavior and I/O path analysis
+# Collects the ScoutFS Triage Cookbook per-node data set (sysfs/debugfs
+# trees, scoutfs counters, fencing config, sysrq stack traces, scoutfs
+# trace, sosreport, crashdump inventory) plus memory, I/O, CPU, and
+# ScoutAM metrics for diagnosing performance problems (e.g. slow tape writes).
 #
-# Usage: ./collect-tape-diag.sh [--duration SECONDS] [--trace] [--output DIR] [--scoutfs-mount PATH] [--no-perf-top]
+# Usage: ./collect-triage.sh [--duration SECONDS] [--no-trace] [--output DIR] [--scoutfs-mount PATH] [--no-perf-top]
 #
 
 set -o pipefail
 
 # Default values
 DURATION=60
-TRACE_ENABLED=false
+TRACE_ENABLED=true
 OUTPUT_DIR=""
 SCOUTFS_MOUNT=""
 INSTALL_MISSING=false
@@ -67,15 +69,18 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") [OPTIONS]
 
-Collect diagnostic data for tape performance analysis.
-Focus: Page cache behavior and I/O path analysis.
+Collect ScoutFS/ScoutAM triage data (Cookbook per-node set) plus tape
+performance diagnostics (page cache behavior and I/O path analysis).
 
 OPTIONS:
     --duration SECONDS   Collection duration (default: 60)
                          Tape operations may need longer (300-600s)
-    --trace              Enable trace-cmd for ScoutFS kernel events.
-                         Higher overhead, larger data files.
-    --output DIR         Output directory (default: tape-diag-YYYYMMDD-HHMMSS)
+    --trace              Enable trace-cmd for ScoutFS kernel events (default).
+    --no-trace           Disable ScoutFS trace collection.
+                         The scoutfs trace is one of the most important parts
+                         of the triage data; only disable it if trace-cmd is
+                         unavailable or the overhead is a concern.
+    --output DIR         Output directory (default: triage-HOSTNAME-YYYYMMDD-HHMMSS)
     --scoutfs-mount PATH ScoutFS mount point (default: auto-detect)
     --install            Auto-install missing utilities via dnf (requires root)
     --no-pprof           Skip ScoutAM Go profiling (enabled by default)
@@ -89,7 +94,7 @@ OPTIONS:
 EXAMPLES:
     $(basename "$0")                           # 60 second collection
     $(basename "$0") --duration 300            # 5 minute collection
-    $(basename "$0") --trace --duration 120    # 2 min with deep tracing
+    $(basename "$0") --no-trace --duration 120 # 2 min without scoutfs trace
     $(basename "$0") --scoutfs-mount /mnt/scoutfs
     $(basename "$0") --install                 # Auto-install missing utilities
     $(basename "$0") --no-pprof                # Skip ScoutAM profiling
@@ -97,6 +102,10 @@ EXAMPLES:
 
 OUTPUT:
     Creates a timestamped directory containing:
+    - sysfs/ (entire /sys/fs/scoutfs tree, read file-by-file)
+    - debugfs/ (entire /sys/kernel/debug/scoutfs tree, read file-by-file)
+    - etc/scoutfs/ (fencing configuration, incl. SCOUTFS_FENCED_RUN)
+    - crash_ls.txt (inventory of /var/crash crashdumps)
     - vmstat.log, iostat.log, iotop.log, sar-paging.log, turbostat.log
     - meminfo/vmstat snapshots (start/end/delta)
     - scoutfs counters (start/end/delta)
@@ -108,9 +117,8 @@ OUTPUT:
     - process-info.txt (scoutamd state)
     - pprof/ (goroutine dumps every 10s; heap, block, mutex once at start)
     - scoutamd-threads/ (kernel stacks, syscalls, memory maps)
-    - scoutfs-trace.gz (if --trace enabled)
+    - scoutfs-trace.gz (unless --no-trace)
     - perf-top.log.gz (perf top output for duration)
-    - debugfs-scoutfs.tar (ScoutFS debugfs tree snapshot)
     - cpuinfo.txt (/proc/cpuinfo snapshot)
     - samcli.txt (ScoutAM scheduler and catalog state)
     - sosreport-*.tar.xz (system diagnostic report, if sos is installed)
@@ -138,123 +146,83 @@ install_missing_packages() {
     return 0
 }
 
-# Check for required utilities
-check_utilities() {
-    local missing_core=()
-    local missing_optional=()
-    local missing_trace=()
-    local packages_to_install=()
+# Map a missing command to its RHEL/Rocky package name.
+util_package() {
+    case "$1" in
+        vmstat)      echo "procps-ng" ;;
+        iostat|sar)  echo "sysstat" ;;
+        iotop)       echo "iotop" ;;
+        turbostat)   echo "kernel-tools" ;;
+        perf)        echo "perf" ;;
+        trace-cmd)   echo "trace-cmd" ;;
+    esac
+}
 
-    # Core utilities (required)
-    for cmd in vmstat iostat sar; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            missing_core+=("$cmd")
-        fi
+# Scan for missing utilities, populating the missing_optional/missing_trace
+# arrays in the caller's scope.
+scan_missing_utils() {
+    missing_optional=()
+    missing_trace=()
+
+    # Performance collectors are optional: a missing one only disables that
+    # single collector, it never blocks ScoutFS triage data collection.
+    for cmd in vmstat iostat sar iotop turbostat; do
+        command -v "$cmd" >/dev/null 2>&1 || missing_optional+=("$cmd")
     done
-
-    # Optional utilities
-    if ! command -v iotop >/dev/null 2>&1; then
-        missing_optional+=("iotop")
-    fi
-    if ! command -v turbostat >/dev/null 2>&1; then
-        missing_optional+=("turbostat")
-    fi
     if [[ "$PERF_TOP_ENABLED" == true ]]; then
-        if ! command -v perf >/dev/null 2>&1; then
-            missing_optional+=("perf")
-        fi
+        command -v perf >/dev/null 2>&1 || missing_optional+=("perf")
     fi
 
-    # Trace utilities (only if --trace enabled)
+    # trace-cmd captures the ScoutFS trace, the single most important piece of
+    # ScoutFS triage data, so it is tracked and warned about separately.
     if [[ "$TRACE_ENABLED" == true ]]; then
-        if ! command -v trace-cmd >/dev/null 2>&1; then
-            missing_trace+=("trace-cmd")
-        fi
+        command -v trace-cmd >/dev/null 2>&1 || missing_trace+=("trace-cmd")
     fi
+}
 
-    # Handle --install flag
-    if [[ "$INSTALL_MISSING" == true ]]; then
-        # Map missing commands to packages
-        if [[ ${#missing_core[@]} -gt 0 ]]; then
-            packages_to_install+=("procps-ng" "sysstat")
-        fi
-        for opt in "${missing_optional[@]}"; do
-            case "$opt" in
-                iotop) packages_to_install+=("iotop") ;;
-                turbostat) packages_to_install+=("kernel-tools") ;;
-                perf) packages_to_install+=("perf") ;;
-            esac
+# Check for utilities.  Nothing here is fatal: the script always collects the
+# core ScoutFS triage data (sysfs/debugfs trees, fencing config, sysrq stack
+# traces, scoutfs trace, sosreport) regardless of which perf tools are present.
+check_utilities() {
+    local missing_optional=() missing_trace=()
+    scan_missing_utils
+
+    # Auto-install missing utilities if requested
+    if [[ "$INSTALL_MISSING" == true && ( ${#missing_optional[@]} -gt 0 || ${#missing_trace[@]} -gt 0 ) ]]; then
+        local packages_to_install=() u
+        for u in "${missing_optional[@]}" "${missing_trace[@]}"; do
+            packages_to_install+=("$(util_package "$u")")
         done
-        for trace in "${missing_trace[@]}"; do
-            case "$trace" in
-                trace-cmd) packages_to_install+=("trace-cmd") ;;
-            esac
-        done
-
-        # Remove duplicates and install
-        if [[ ${#packages_to_install[@]} -gt 0 ]]; then
-            local unique_packages
-            unique_packages=($(printf '%s\n' "${packages_to_install[@]}" | sort -u))
-            if install_missing_packages "${unique_packages[@]}"; then
-                # Re-check after installation
-                missing_core=()
-                missing_optional=()
-                missing_trace=()
-
-                for cmd in vmstat iostat sar; do
-                    if ! command -v "$cmd" >/dev/null 2>&1; then
-                        missing_core+=("$cmd")
-                    fi
-                done
-                if ! command -v iotop >/dev/null 2>&1; then
-                    missing_optional+=("iotop")
-                fi
-                if ! command -v turbostat >/dev/null 2>&1; then
-                    missing_optional+=("turbostat")
-                fi
-                if [[ "$PERF_TOP_ENABLED" == true ]]; then
-                    if ! command -v perf >/dev/null 2>&1; then
-                        missing_optional+=("perf")
-                    fi
-                fi
-                if [[ "$TRACE_ENABLED" == true ]]; then
-                    if ! command -v trace-cmd >/dev/null 2>&1; then
-                        missing_trace+=("trace-cmd")
-                    fi
-                fi
-            fi
+        local unique_packages
+        unique_packages=($(printf '%s\n' "${packages_to_install[@]}" | sort -u))
+        if install_missing_packages "${unique_packages[@]}"; then
+            scan_missing_utils
         fi
     fi
 
-    # Report missing core utilities and exit
-    if [[ ${#missing_core[@]} -gt 0 ]]; then
-        echo "ERROR: Missing required utilities: ${missing_core[*]}"
-        echo ""
-        echo "Install packages (RHEL/Rocky):"
-        echo "  vmstat, iostat, sar: dnf install procps-ng sysstat"
-        echo ""
-        echo "Or run with --install to auto-install missing packages"
-        exit 1
-    fi
-
-    # Warn about missing optional utilities
+    # Warn about missing optional performance collectors
     if [[ ${#missing_optional[@]} -gt 0 ]]; then
         echo "WARNING: Missing optional utilities: ${missing_optional[*]}"
+        echo "  vmstat: dnf install procps-ng"
+        echo "  iostat, sar: dnf install sysstat"
         echo "  iotop: dnf install iotop"
         echo "  turbostat: dnf install kernel-tools"
         echo "  perf: dnf install perf"
-        echo "These collectors will be skipped."
+        echo "These collectors will be skipped; ScoutFS triage data is still collected."
         echo ""
 
         # Record missing utilities
         printf '%s\n' "${missing_optional[@]}" > "$OUTPUT_DIR/missing-utils.txt"
     fi
 
-    # Warn about missing trace utilities
+    # Loudly warn about missing trace-cmd - the most important triage artifact
     if [[ ${#missing_trace[@]} -gt 0 ]]; then
-        echo "WARNING: Missing trace utilities: ${missing_trace[*]}"
-        echo "  trace-cmd: dnf install trace-cmd"
-        echo "Trace collection will be skipped."
+        echo "*****************************************************************"
+        echo "* trace-cmd is not installed.  The scoutfs trace it captures   *"
+        echo "* is one of the most important parts of the triage data.       *"
+        echo "* Install it with 'dnf install -y trace-cmd' (or re-run with   *"
+        echo "* --install) and collect again if at all possible.             *"
+        echo "*****************************************************************"
         echo ""
 
         # Append to missing utilities file
@@ -340,16 +308,17 @@ collect_start_snapshots() {
     # vmstat counters
     cat /proc/vmstat > "$OUTPUT_DIR/vmstat-start.txt" 2>&1
 
-    # ScoutFS counters
-    local scoutfs_debug
-    if scoutfs_debug=$(get_scoutfs_debug_path); then
-        if [[ -f "$scoutfs_debug/counters" ]]; then
-            cat "$scoutfs_debug/counters" > "$OUTPUT_DIR/scoutfs-counters-start.txt" 2>&1
-        fi
-    fi
+    # ScoutFS counters (sysfs dir or debugfs file)
+    snapshot_scoutfs_counters "$OUTPUT_DIR/scoutfs-counters-start.txt"
 
-    # ScoutFS debugfs tree
-    collect_debugfs_scoutfs
+    # ScoutFS sysfs and debugfs trees
+    collect_scoutfs_trees
+
+    # Fencing configuration
+    collect_fencing_config
+
+    # Crashdump inventory
+    collect_crashdumps
 
     # ScoutAM CLI
     collect_samcli
@@ -391,13 +360,8 @@ collect_end_snapshots() {
     # vmstat counters
     cat /proc/vmstat > "$OUTPUT_DIR/vmstat-end.txt" 2>&1
 
-    # ScoutFS counters
-    local scoutfs_debug
-    if scoutfs_debug=$(get_scoutfs_debug_path); then
-        if [[ -f "$scoutfs_debug/counters" ]]; then
-            cat "$scoutfs_debug/counters" > "$OUTPUT_DIR/scoutfs-counters-end.txt" 2>&1
-        fi
-    fi
+    # ScoutFS counters (sysfs dir or debugfs file)
+    snapshot_scoutfs_counters "$OUTPUT_DIR/scoutfs-counters-end.txt"
 
     # FC host statistics
     collect_fc_stats "$OUTPUT_DIR/fc-stats-end.txt"
@@ -727,16 +691,22 @@ start_collectors() {
     echo "Starting background collectors for ${DURATION}s..."
 
     # vmstat - 1 second interval
-    vmstat 1 > "$OUTPUT_DIR/vmstat.log" 2>&1 &
-    BG_PIDS+=($!)
+    if command -v vmstat >/dev/null 2>&1; then
+        vmstat 1 > "$OUTPUT_DIR/vmstat.log" 2>&1 &
+        BG_PIDS+=($!)
+    fi
 
     # iostat - 1 second interval, extended stats, all devices
-    iostat -x 1 > "$OUTPUT_DIR/iostat.log" 2>&1 &
-    BG_PIDS+=($!)
+    if command -v iostat >/dev/null 2>&1; then
+        iostat -x 1 > "$OUTPUT_DIR/iostat.log" 2>&1 &
+        BG_PIDS+=($!)
+    fi
 
     # sar - paging stats, 1 second interval
-    sar -B 1 "$DURATION" > "$OUTPUT_DIR/sar-paging.log" 2>&1 &
-    BG_PIDS+=($!)
+    if command -v sar >/dev/null 2>&1; then
+        sar -B 1 "$DURATION" > "$OUTPUT_DIR/sar-paging.log" 2>&1 &
+        BG_PIDS+=($!)
+    fi
 
     # iotop - optional
     if command -v iotop >/dev/null 2>&1; then
@@ -830,16 +800,83 @@ stop_perf_top() {
     fi
 }
 
-collect_debugfs_scoutfs() {
-    local debug_base="/sys/kernel/debug/scoutfs"
-    if [[ ! -d "$debug_base" ]]; then
-        echo "WARNING: $debug_base not found, skipping debugfs tar"
-        return
+# Copy a sysfs/debugfs tree under the given destination dir.  These files
+# don't report their real size (debugfs reports 0, sysfs 4096), so tar
+# would archive them empty or padded with zeros; read them instead.
+copy_tree() {
+    local dest="$1" src="$2" f
+    [[ -d "$src" ]] || return 1
+
+    find "$src" -type f 2>/dev/null | while read -r f; do
+        mkdir -p "$dest$(dirname "$f")"
+        timeout 30 cat "$f" > "$dest$f" 2>&1
+    done
+}
+
+# Collect the full ScoutFS sysfs and debugfs trees (Cookbook per-node data).
+# Counters, mount/volume options, quorum, fence and srch state all live in
+# the sysfs tree on current builds.
+collect_scoutfs_trees() {
+    if [[ -d /sys/fs/scoutfs ]]; then
+        echo "Collecting ScoutFS sysfs tree..."
+        copy_tree "$OUTPUT_DIR/sysfs" /sys/fs/scoutfs
+    else
+        echo "WARNING: /sys/fs/scoutfs not found, skipping sysfs tree"
     fi
 
-    echo "Collecting ScoutFS debugfs..."
-    tar cf "$OUTPUT_DIR/debugfs-scoutfs.tar" -C /sys/kernel/debug scoutfs 2>&1 \
-        || echo "WARNING: failed to tar $debug_base" >&2
+    if [[ -d /sys/kernel/debug/scoutfs ]]; then
+        echo "Collecting ScoutFS debugfs tree..."
+        copy_tree "$OUTPUT_DIR/debugfs" /sys/kernel/debug/scoutfs
+    else
+        echo "WARNING: /sys/kernel/debug/scoutfs not found, skipping debugfs tree"
+    fi
+}
+
+# Capture fencing configuration (/etc/scoutfs and the fenced run file).
+collect_fencing_config() {
+    [[ -d /etc/scoutfs ]] || return 0
+
+    echo "Collecting fencing configuration..."
+    mkdir -p "$OUTPUT_DIR/etc/scoutfs"
+    cp -r /etc/scoutfs/. "$OUTPUT_DIR/etc/scoutfs/" 2>/dev/null
+
+    if [[ -f /etc/scoutfs/scoutfs-fenced.conf ]]; then
+        # Read SCOUTFS_FENCED_RUN in a subshell so we don't clobber our own vars.
+        local fenced_run
+        fenced_run=$(source /etc/scoutfs/scoutfs-fenced.conf 2>/dev/null; echo "${SCOUTFS_FENCED_RUN:-}")
+        if [[ -n "$fenced_run" && -e "$fenced_run" ]]; then
+            cp -r "$fenced_run" "$OUTPUT_DIR/etc/scoutfs/" 2>/dev/null
+        fi
+    fi
+}
+
+# Inventory any existing crashdumps (do not generate new ones).
+collect_crashdumps() {
+    find /var/crash -ls > "$OUTPUT_DIR/crash_ls.txt" 2>&1
+}
+
+# Snapshot ScoutFS counters to a "name value" file for delta computation.
+# Prefers the sysfs counters directory (one file per counter, current
+# layout); falls back to a single debugfs counters file (older layout).
+snapshot_scoutfs_counters() {
+    local out="$1"
+    local ctr_dir
+    ctr_dir=$(find /sys/fs/scoutfs -mindepth 2 -maxdepth 2 -type d -name counters 2>/dev/null | head -1)
+    if [[ -n "$ctr_dir" ]]; then
+        local f
+        for f in "$ctr_dir"/*; do
+            [[ -f "$f" ]] || continue
+            printf '%s %s\n' "$(basename "$f")" "$(cat "$f" 2>/dev/null)"
+        done > "$out"
+        return 0
+    fi
+
+    local scoutfs_debug
+    if scoutfs_debug=$(get_scoutfs_debug_path) && [[ -f "$scoutfs_debug/counters" ]]; then
+        cat "$scoutfs_debug/counters" > "$out" 2>&1
+        return 0
+    fi
+    return 1
 }
 
 # Check if pprof port is responding
@@ -1021,7 +1058,10 @@ collect_sos_report() {
     local sos_output
     local sos_exit_code
 
-    sos_output=$(sos report --batch --quiet 2>&1)
+    # sos can hang on a wedged node; bound it so the tarball still gets made.
+    # --foreground keeps sos in the terminal's process group, otherwise commands
+    # it runs that touch the tty (e.g. slabtop) are stopped by SIGTTOU.
+    sos_output=$(timeout --foreground -k 60 1800 sos report --batch --quiet 2>&1)
     sos_exit_code=$?
 
     if [[ $sos_exit_code -ne 0 ]]; then
@@ -1078,6 +1118,10 @@ parse_args() {
                 ;;
             --trace)
                 TRACE_ENABLED=true
+                shift
+                ;;
+            --no-trace)
+                TRACE_ENABLED=false
                 shift
                 ;;
             --output)
@@ -1140,12 +1184,12 @@ main() {
 
     # Set up output directory
     if [[ -z "$OUTPUT_DIR" ]]; then
-        OUTPUT_DIR="tape-diag-$(date +%Y%m%d-%H%M%S)"
+        OUTPUT_DIR="triage-$(hostname -s)-$(date +%Y%m%d-%H%M%S)"
     fi
     mkdir -p "$OUTPUT_DIR"
 
     echo "============================================="
-    echo "Tape Performance Diagnostic Collection"
+    echo "ScoutFS/ScoutAM Triage Collection"
     echo "============================================="
     echo "Duration:    ${DURATION}s"
     echo "Trace:       $TRACE_ENABLED"
