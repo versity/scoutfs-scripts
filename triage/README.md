@@ -1,6 +1,6 @@
 # collect-triage.sh
 
-Diagnostic collection script for troubleshooting slow tape write performance on ScoutFS/ScoutAM systems. Captures memory, I/O, CPU, kernel, and ScoutFS-specific metrics over a configurable duration.
+Triage collection script for ScoutFS/ScoutAM systems. Captures the ScoutFS Triage Cookbook per-node data set (sysfs/debugfs trees, counters, fencing config, sysrq stack traces, scoutfs trace, sosreport, crashdump inventory) plus memory, I/O, CPU, kernel, and ScoutAM performance metrics over a configurable duration.
 
 ## Quick Start
 
@@ -11,8 +11,8 @@ sudo ./collect-triage.sh
 # 5-minute collection, skip SOS report for speed
 sudo ./collect-triage.sh --duration 300 --no-sos
 
-# With deep kernel tracing
-sudo ./collect-triage.sh --trace --duration 120
+# Without the scoutfs trace (e.g. trace-cmd unavailable)
+sudo ./collect-triage.sh --no-trace --duration 120
 
 # Auto-install missing utilities
 sudo ./collect-triage.sh --install
@@ -21,17 +21,18 @@ sudo ./collect-triage.sh --install
 ## Requirements
 
 - **OS:** RHEL/Rocky Linux (tested on RHEL 9)
-- **Root:** Recommended. Some collectors (iotop, turbostat, sysrq, trace-cmd) require root.
-- **Core utilities:** `vmstat`, `iostat`, `sar` (from `procps-ng` and `sysstat` packages)
-- **Optional utilities:** `iotop`, `turbostat` (`kernel-tools`), `perf`, `trace-cmd`, `sos`, `curl`
+- **Root:** Recommended. Some collectors (debugfs tree, iotop, turbostat, sysrq, trace-cmd) require root.
+- **Most important:** `trace-cmd` — captures the ScoutFS trace, the single most important triage artifact. Install `trace-cmd` before collecting if at all possible.
+- **Optional utilities:** `vmstat` (`procps-ng`), `iostat`/`sar` (`sysstat`), `iotop`, `turbostat` (`kernel-tools`), `perf`, `sos`, `curl`. None are required — if missing, that collector is skipped and the rest of the triage data is still collected.
 
 ## Options
 
 | Option | Description |
 |---|---|
 | `--duration SECONDS` | Collection duration (default: 60). Tape ops may need 300-600s. |
-| `--trace` | Enable trace-cmd for ScoutFS kernel events. Higher overhead. |
-| `--output DIR` | Output directory (default: `tape-diag-YYYYMMDD-HHMMSS`) |
+| `--trace` | Enable trace-cmd for ScoutFS kernel events (**default on**). |
+| `--no-trace` | Disable the ScoutFS trace (one of the most important triage artifacts; only skip if trace-cmd is unavailable). |
+| `--output DIR` | Output directory (default: `triage-HOSTNAME-YYYYMMDD-HHMMSS`) |
 | `--scoutfs-mount PATH` | ScoutFS mount point (default: auto-detect from `/proc/mounts`) |
 | `--install` | Auto-install missing utilities via `dnf` (requires root) |
 | `--no-pprof` | Skip ScoutAM Go profiling |
@@ -48,8 +49,11 @@ sudo ./collect-triage.sh --install
 | `meminfo-start.txt` / `meminfo-end.txt` | `/proc/meminfo` |
 | `cpuinfo.txt` | `/proc/cpuinfo` |
 | `vmstat-start.txt` / `vmstat-end.txt` | `/proc/vmstat` counters |
-| `scoutfs-counters-start.txt` / `scoutfs-counters-end.txt` | ScoutFS debugfs counters |
-| `debugfs-scoutfs.tar` | Full ScoutFS debugfs tree |
+| `scoutfs-counters-start.txt` / `scoutfs-counters-end.txt` | ScoutFS counters (sysfs counters dir, or debugfs counters file on older builds) |
+| `sysfs/` | Full ScoutFS sysfs tree (`/sys/fs/scoutfs`), read file-by-file |
+| `debugfs/` | Full ScoutFS debugfs tree (`/sys/kernel/debug/scoutfs`), read file-by-file |
+| `etc/scoutfs/` | Fencing configuration (incl. the `SCOUTFS_FENCED_RUN` file) |
+| `crash_ls.txt` | Inventory of `/var/crash` crashdumps (`find /var/crash -ls`) |
 | `samcli.txt` | `samcli scheduler`, `samcli scheduler -d`, `samcli catalog`, `samcli catalog pool` |
 | `fc-stats-start.txt` / `fc-stats-end.txt` | FC host statistics from `/sys/class/fc_host/` |
 | `sys_block_settings.csv` | Block device queue settings (max_sectors_kb, nr_requests, scheduler, etc.) |
@@ -70,7 +74,7 @@ sudo ./collect-triage.sh --install
 | `iotop.log` | 1s (if available) |
 | `turbostat.log` | 1s (if available) |
 | `perf-top.log.gz` | 1s (if enabled) |
-| `scoutfs-trace.gz` | Continuous (if `--trace`) |
+| `scoutfs-trace.gz` | Continuous (unless `--no-trace`) |
 
 ### ScoutAM pprof (if responding on ports 6060-6062)
 
@@ -101,8 +105,8 @@ sudo ./collect-triage.sh --install
 The script creates a timestamped directory and a corresponding `.tar.gz` tarball:
 
 ```
-tape-diag-20260123-143022/
-tape-diag-20260123-143022.tar.gz
+triage-HOSTNAME-20260123-143022/
+triage-HOSTNAME-20260123-143022.tar.gz
 ```
 
 Press `Ctrl+C` to stop collection early -- end snapshots and the tarball are still generated via the cleanup trap.
