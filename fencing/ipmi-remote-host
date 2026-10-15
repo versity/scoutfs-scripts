@@ -15,6 +15,15 @@ SCOUTFS_IPMI_HOSTS_FILE=${SCOUTFS_IPMI_HOSTS_FILE:-/etc/scoutfs/scoutfs-ipmi-hos
 ## IPMI_OPTS="-D LAN_2_0 -u $IPMI_USER -p $IPMI_PASSWORD -I 17"
 ## SSH_USER="user"
 ## SSH_IDENTS="-i /home/user/.ssh/id_rsa -i /home/user/.ssh/id_rsa.pub"
+##
+## optional, to use ipmitool instead of ipmipower (e.g. for FIPS mode).
+## IPMI_OPTS is only used by ipmipower and IPMITOOL_OPTS only by ipmitool.
+## IPMITOOL_OPTS defaults to the value below, -E reads IPMI_PASSWORD from
+## the environment so the password isn't visible in the process list.
+##
+## IPMI_TOOL="ipmitool"
+## IPMITOOL_OPTS="-I lanplus -C 17 -U $IPMI_USER -E"
+## IPMI_TIMEOUT="8"
 
 ## hosts file format:
 ## SCOUTFS_HOST_IP IPMI_ADDRESS
@@ -23,11 +32,22 @@ SCOUTFS_IPMI_HOSTS_FILE=${SCOUTFS_IPMI_HOSTS_FILE:-/etc/scoutfs/scoutfs-ipmi-hos
 
 # command setup
 IPMI_POWER="/sbin/ipmipower"
+IPMITOOL="/usr/bin/ipmitool"
+TIMEOUT="/usr/bin/timeout"
 LOGGER="/bin/logger -p local3.crit -t scoutfs-fenced"
 
 # SSH setup to allow non-root SSH connections
 SSH_USER="root"
 SSH_IDENTS=""
+
+# ipmipower (default) or ipmitool
+IPMI_TOOL="ipmipower"
+
+# ipmitool only: total seconds allowed for power off and confirming the
+# host is off.  The kernel waits 15s for a new leader to fence the
+# previous leader (SCOUTFS_QUORUM_FENCE_TO_MS), which must also cover
+# scoutfs-fenced noticing the request and the ssh mount check.
+IPMI_TIMEOUT="8"
 
 $LOGGER "ipmi fence script invoked: IP: $SCOUTFS_FENCED_REQ_IP RID: $SCOUTFS_FENCED_REQ_RID TEST: $IPMITEST"
 
@@ -59,8 +79,26 @@ test -n "$SCOUTFS_IPMI_HOSTS_FILE" || \
     echo_fail "SCOUTFS_IPMI_HOSTS_FILE isn't set"
 test -r "$SCOUTFS_IPMI_HOSTS_FILE" || \
     echo_fail "$SCOUTFS_IPMI_HOSTS_FILE isn't readable file"
-test -x "$IPMI_POWER" || \
-    echo_fail "$IPMI_POWER not found, need to install freeimpi?"
+case "$IPMI_TOOL" in
+    ipmipower)
+        test -x "$IPMI_POWER" || \
+            echo_fail "$IPMI_POWER not found, need to install freeimpi?"
+        ;;
+    ipmitool)
+        test -x "$IPMITOOL" || \
+            echo_fail "$IPMITOOL not found, need to install ipmitool?"
+        test -x "$TIMEOUT" || \
+            echo_fail "$TIMEOUT not found, need to install coreutils?"
+        [[ "$IPMI_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || \
+            echo_fail "IPMI_TIMEOUT '$IPMI_TIMEOUT' must be a positive number of seconds"
+        IPMITOOL_OPTS=${IPMITOOL_OPTS:-"-I lanplus -C 17 -U $IPMI_USER -E"}
+        # for -E
+        export IPMI_PASSWORD
+        ;;
+    *)
+        echo_fail "IPMI_TOOL '$IPMI_TOOL' must be ipmipower or ipmitool"
+        ;;
+esac
 
 export ip="$SCOUTFS_FENCED_REQ_IP"
 export rid="$SCOUTFS_FENCED_REQ_RID"
@@ -73,7 +111,49 @@ getIPMIhost () {
     echo "$host"
 }
 
+# run ipmitool against a host, killing it after the given seconds.
+# -N/-R come first so they can be overridden in IPMITOOL_OPTS.
+ipmitoolRun() {
+    local host="$1"
+    local secs="$2"
+    shift 2
+
+    $TIMEOUT "$secs" $IPMITOOL -N 1 -R 1 $IPMITOOL_OPTS -H "$host" "$@"
+}
+
+# ipmitool returns once the BMC accepts the power off, so poll the
+# status until it's off or IPMI_TIMEOUT expires.  A failed power off
+# isn't fatal by itself, some BMCs return an error if already off.
+ipmitoolPowerOff() {
+    local deadline=$((SECONDS + IPMI_TIMEOUT))
+    local remaining
+    local output
+
+    output=$(ipmitoolRun "$1" "$IPMI_TIMEOUT" chassis power off 2>&1) || \
+        echo_log "ipmitool power off $1 returned error, checking status: $output"
+
+    while true; do
+        remaining=$((deadline - SECONDS))
+        if [ "$remaining" -le 0 ]; then
+            echo_fail "ipmitool stat $1 not off after ${IPMI_TIMEOUT}s: $output"
+        fi
+
+        output=$(ipmitoolRun "$1" "$remaining" chassis power status 2>&1)
+        if [[ "$output" =~ "Chassis Power is off" ]]; then
+            return
+        fi
+
+        sleep 1
+    done
+}
+
 powerOffHost() {
+    if [ "$IPMI_TOOL" = "ipmitool" ]; then
+        ipmitoolPowerOff "$1"
+        $LOGGER "ipmi fence power down $1 success"
+        exit 0
+    fi
+
     # older versions of ipmipower inverted wait-until-off/wait-until-on, so specify both
     $IPMI_POWER $IPMI_OPTS -h "$1" --wait-until-off --wait-until-on --off || \
         echo_fail "ipmi power off $1 failed"
@@ -101,7 +181,12 @@ if [ -n "$IPMITEST" ]; then
         if [ -z "$host" ]; then
             echo_test_fail "ipmi config $i $host"
         else
-            if ! $IPMI_POWER $IPMI_OPTS -h "$host" --stat; then
+            if [ "$IPMI_TOOL" = "ipmitool" ]; then
+                ipmitoolRun "$host" "$IPMI_TIMEOUT" chassis power status
+            else
+                $IPMI_POWER $IPMI_OPTS -h "$host" --stat
+            fi
+            if [ "$?" != 0 ]; then
                 echo_test_fail "ipmi $i"
             else
                 echo_test_pass "ipmi $i"
