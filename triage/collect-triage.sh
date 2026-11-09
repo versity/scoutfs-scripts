@@ -26,6 +26,113 @@ PERF_TOP_ENABLED=true
 # PID tracking for background processes
 declare -a BG_PIDS=()
 
+# Run a command or shell function with a time limit and never block on it.
+# `timeout` is not enough on a hung ScoutFS node: a process stuck in
+# uninterruptible (D) sleep ignores SIGKILL, and timeout then waits on it
+# forever.  Instead, poll the command; if it overruns, kill it and move on
+# without waiting.  Abandoned commands are listed in hung-commands.txt.
+bounded() {
+    local secs="$1"; shift
+    "$@" &
+    local pid=$! ticks=0
+    while kill -0 "$pid" 2>/dev/null; do
+        if (( ticks >= secs * 20 )); then
+            echo "WARNING: abandoned after ${secs}s (likely blocked in D state): $*" \
+                | tee -a "$OUTPUT_DIR/hung-commands.txt" >&2
+            pkill -9 -P "$pid" 2>/dev/null
+            kill -9 "$pid" 2>/dev/null
+            return 124
+        fi
+        sleep 0.05
+        ticks=$((ticks + 1))
+    done
+    wait "$pid"
+}
+
+# Run one collection step under bounded() and record it in steps.log with
+# start/end times and exit status (124 = abandoned), so a capture that stops
+# early shows which step it stopped in.  zib/20261106: vers06's capture lost
+# its debugfs and fencing config with nothing to say why.
+step() {
+    local name="$1" secs="$2"; shift 2
+    local t0=$SECONDS rc
+    echo "$(date '+%F %T') start $name" >> "$OUTPUT_DIR/steps.log"
+    bounded "$secs" "$@"
+    rc=$?
+    echo "$(date '+%F %T') end   $name rc=$rc $((SECONDS - t0))s" >> "$OUTPUT_DIR/steps.log"
+    return $rc
+}
+
+# Free space (MB) on the filesystem holding OUTPUT_DIR.
+free_mb() {
+    df -Pm "$OUTPUT_DIR" 2>/dev/null | awk 'NR==2 {print $4}'
+}
+
+# Stop the open-ended collectors if the output filesystem runs low, so the
+# capture finishes and the node's /var/tmp is not filled.
+# The space watchdog (below) flags low space with .low-space; this acts on
+# it, or on its own df check, once.
+MIN_FREE_MB=1024
+LOW_SPACE=false
+check_space() {
+    local free
+    [[ "$LOW_SPACE" == true ]] && return 1
+    free=$(free_mb)
+    if [[ -e "$OUTPUT_DIR/.low-space" ]] || { [[ -n "$free" ]] && (( free < MIN_FREE_MB )); }; then
+        LOW_SPACE=true
+        echo "$(date '+%F %T') WARNING: low space (${free:-?} MB free) under $OUTPUT_DIR; stopping trace, perf, background collectors and hang samples" \
+            | tee -a "$OUTPUT_DIR/steps.log" >&2
+        stop_trace
+        stop_perf_top
+        HANG_SAMPLES_ENABLED=false
+        local pid
+        for pid in "${BG_PIDS[@]}"; do
+            kill "$pid" 2>/dev/null
+        done
+        BG_PIDS=()
+        return 1
+    fi
+}
+
+# Background disk-space watchdog, started with the trace and running for the
+# whole capture.  The main loop's check_space only starts after the start
+# snapshots, which can take minutes; a busy node's scoutfs trace can fill
+# the disk well before that (zib/20261109: vers06 wrote 31 GB of trace in
+# about two minutes, and the merge into trace.dat then failed).
+#
+# Stops the trace while there is still room to merge it: trace-cmd copies
+# its per-CPU files into trace.dat, so it needs about their size again.
+# Flags .low-space for check_space to stop everything else.
+WATCHDOG_PID=""
+space_watchdog() {
+    local trace_pid="$1" free trace_mb
+    while [[ ! -e "$OUTPUT_DIR/.watchdog.stop" ]]; do
+        free=$(free_mb)
+        trace_mb=$(du -cm "$OUTPUT_DIR"/trace.dat.cpu* 2>/dev/null | awk 'END {print $1 + 0}')
+        if [[ -n "$free" ]] && (( free - trace_mb < MIN_FREE_MB )); then
+            echo "$(date '+%F %T') WARNING: ${free} MB free, ${trace_mb} MB of unmerged trace; stopping trace early" \
+                | tee -a "$OUTPUT_DIR/steps.log" >&2
+            touch "$OUTPUT_DIR/.low-space" "$OUTPUT_DIR/.perf-top.stop"
+            [[ -n "$trace_pid" ]] && pkill -TERM -x sleep -P "$trace_pid" 2>/dev/null
+            return
+        fi
+        sleep 2
+    done
+}
+
+start_space_watchdog() {
+    rm -f "$OUTPUT_DIR/.watchdog.stop" "$OUTPUT_DIR/.low-space"
+    space_watchdog "$TRACE_CMD_PID" < /dev/null &
+    WATCHDOG_PID=$!
+}
+
+stop_space_watchdog() {
+    [[ -n "$WATCHDOG_PID" ]] || return 0
+    touch "$OUTPUT_DIR/.watchdog.stop"
+    kill "$WATCHDOG_PID" 2>/dev/null
+    WATCHDOG_PID=""
+}
+
 # Cleanup function
 cleanup() {
     echo ""
@@ -39,11 +146,19 @@ cleanup() {
 
     # Collect end snapshots if OUTPUT_DIR exists
     if [[ -n "$OUTPUT_DIR" && -d "$OUTPUT_DIR" ]]; then
+        # Already stopped on a normal run; not after Ctrl-C.  The trace
+        # runs until stopped, so it must be stopped here.
+        stop_trace
+        stop_perf_top
+
         collect_end_snapshots
         calculate_deltas
 
         # Collect SOS report (do last before tarball, can be slow)
         collect_sos_report
+
+        stop_space_watchdog
+        rm -f "$OUTPUT_DIR/.watchdog.stop" "$OUTPUT_DIR/.low-space" "$OUTPUT_DIR/.perf-top.stop"
 
         # Create tarball
         local parent_dir
@@ -80,12 +195,16 @@ OPTIONS:
                          The scoutfs trace is one of the most important parts
                          of the triage data; only disable it if trace-cmd is
                          unavailable or the overhead is a concern.
-    --output DIR         Output directory (default: triage-HOSTNAME-YYYYMMDD-HHMMSS)
+    --trace-max-mb N     Cap the scoutfs trace at N MB (default: 1/4 of free
+                         space, at most 4096).  The most recent events are
+                         kept once the cap is reached.
+    --output DIR         Output directory on local disk, needs 4 GB free
+                         (default: /var/tmp/triage-HOSTNAME-YYYYMMDD-HHMMSS)
     --scoutfs-mount PATH ScoutFS mount point (default: auto-detect)
     --install            Auto-install missing utilities via dnf (requires root)
     --no-pprof           Skip ScoutAM Go profiling (enabled by default)
     --no-sos             Skip SOS report collection (enabled by default)
-    --no-perf-top        Skip perf top collection (enabled by default)
+    --no-perf-top        Skip perf CPU sampling (enabled by default)
     --profile-scheduler N   Collect a ${N}s CPU profile from the ScoutAM scheduler
                             pprof endpoint (only runs on the scheduler node,
                             detected via port 8888 listening)
@@ -103,7 +222,21 @@ EXAMPLES:
 OUTPUT:
     Creates a timestamped directory containing:
     - sysfs/ (entire /sys/fs/scoutfs tree, read file-by-file)
-    - debugfs/ (entire /sys/kernel/debug/scoutfs tree, read file-by-file)
+    - debugfs/ (entire /sys/kernel/debug/scoutfs tree, read file-by-file;
+      lock state first: server_locks, client_locks, messages, connections)
+    - steps.log (start/end time and exit status of each collection step;
+      rc=124 means the step was abandoned, see hung-commands.txt)
+    - hang-samples/tNNNN/ (every 10s: debugfs lock/message state, D-state
+      stacks, ss -tnpie; to tell a deadlock from slow progress)
+    - versions.txt (kernel, scoutfs module, packages, cmdline)
+    - journal/ (systemd journals for scout* units and the kernel, this and
+      the previous boot)
+    - network-start/end.txt, net-counters-start/end/delta.txt (ss, ip,
+      ethtool, TCP/IP counters)
+    - time-sync.txt (timedatectl, chronyc)
+    - pressure-, buddyinfo-, slabinfo-start/end.txt; sysctl.txt
+    - scsi-devices.txt, scsi-stats-start/end/delta.txt (tape and SCSI
+      device I/O and error counters)
     - etc/scoutfs/ (fencing configuration, incl. SCOUTFS_FENCED_RUN)
     - crash_ls.txt (inventory of /var/crash crashdumps)
     - vmstat.log, iostat.log, iotop.log, sar-paging.log, turbostat.log
@@ -113,12 +246,14 @@ OUTPUT:
     - sys_block_settings.csv (block device queue settings)
     - device-hierarchy.txt (MDRAID, DM, multipath topology)
     - ps-auxf.txt, top.txt (running processes)
-    - dmesg.log, sysrq-t.log, sysrq-l.log (kernel logs and stack traces)
+    - dmesg.log, sysrq-w.log, sysrq-t.log, sysrq-l.log (kernel logs and stack traces)
+    - dstate-stacks.txt (kernel stacks of D-state tasks, from /proc)
     - process-info.txt (scoutamd state)
+    - scoutfs-statfs.txt (scoutfs statfs for every scoutfs mount)
     - pprof/ (goroutine dumps every 10s; heap, block, mutex once at start)
     - scoutamd-threads/ (kernel stacks, syscalls, memory maps)
-    - scoutfs-trace.gz (unless --no-trace)
-    - perf-top.log.gz (perf top output for duration)
+    - scoutfs-trace.gz (unless --no-trace), trace-cmd.log
+    - perf-top.log.gz (perf record/report CPU samples every 5s for duration)
     - cpuinfo.txt (/proc/cpuinfo snapshot)
     - samcli.txt (ScoutAM scheduler and catalog state)
     - sosreport-*.tar.xz (system diagnostic report, if sos is installed)
@@ -154,6 +289,8 @@ util_package() {
         iotop)       echo "iotop" ;;
         turbostat)   echo "kernel-tools" ;;
         perf)        echo "perf" ;;
+        lsscsi)      echo "lsscsi" ;;
+        ethtool)     echo "ethtool" ;;
         trace-cmd)   echo "trace-cmd" ;;
     esac
 }
@@ -166,7 +303,7 @@ scan_missing_utils() {
 
     # Performance collectors are optional: a missing one only disables that
     # single collector, it never blocks ScoutFS triage data collection.
-    for cmd in vmstat iostat sar iotop turbostat; do
+    for cmd in vmstat iostat sar iotop turbostat lsscsi ethtool; do
         command -v "$cmd" >/dev/null 2>&1 || missing_optional+=("$cmd")
     done
     if [[ "$PERF_TOP_ENABLED" == true ]]; then
@@ -208,6 +345,8 @@ check_utilities() {
         echo "  iotop: dnf install iotop"
         echo "  turbostat: dnf install kernel-tools"
         echo "  perf: dnf install perf"
+        echo "  lsscsi: dnf install lsscsi"
+        echo "  ethtool: dnf install ethtool"
         echo "These collectors will be skipped; ScoutFS triage data is still collected."
         echo ""
 
@@ -299,6 +438,10 @@ collect_samcli() {
 collect_start_snapshots() {
     echo "Collecting start snapshots..."
 
+    # Kernel logs and stack traces first: on a hung node these are the most
+    # important data and nothing below may get to run.
+    step "kernel state" 600 collect_kernel_state
+
     # Memory info
     cat /proc/meminfo > "$OUTPUT_DIR/meminfo-start.txt" 2>&1
 
@@ -308,46 +451,62 @@ collect_start_snapshots() {
     # vmstat counters
     cat /proc/vmstat > "$OUTPUT_DIR/vmstat-start.txt" 2>&1
 
-    # ScoutFS counters (sysfs dir or debugfs file)
-    snapshot_scoutfs_counters "$OUTPUT_DIR/scoutfs-counters-start.txt"
+    # Fencing configuration and crashdump inventory: plain files under /etc
+    # and /var, so they cannot hang; taken before anything that can.
+    step "fencing config" 30 collect_fencing_config
+    step "crashdumps" 30 collect_crashdumps
+    step "versions" 60 collect_versions > "$OUTPUT_DIR/versions.txt" 2>&1
 
-    # ScoutFS sysfs and debugfs trees
+    # ScoutFS counters (sysfs dir or debugfs file)
+    step "scoutfs counters" 30 snapshot_scoutfs_counters "$OUTPUT_DIR/scoutfs-counters-start.txt"
+
+    # ScoutFS debugfs (lock state) and sysfs trees
     collect_scoutfs_trees
 
-    # Fencing configuration
-    collect_fencing_config
+    # systemd journals (fencing, quorum, scoutamd)
+    step "journals" 180 collect_journals
 
-    # Crashdump inventory
-    collect_crashdumps
+    # Network, clock sync, memory pressure, SCSI/tape
+    step "network" 60 collect_network start > "$OUTPUT_DIR/network-start.txt" 2>&1
+    step "net counters" 10 snapshot_net_counters > "$OUTPUT_DIR/net-counters-start.txt"
+    step "time sync" 40 collect_time_sync > "$OUTPUT_DIR/time-sync.txt" 2>&1
+    step "pressure" 30 collect_pressure start
+    step "sysctl" 30 sysctl -a > "$OUTPUT_DIR/sysctl.txt" 2>&1
+    step "scsi inventory" 30 collect_scsi_inventory > "$OUTPUT_DIR/scsi-devices.txt" 2>&1
+    step "scsi stats" 30 snapshot_scsi_stats > "$OUTPUT_DIR/scsi-stats-start.txt"
 
     # ScoutAM CLI
-    collect_samcli
+    step "samcli" 120 collect_samcli
 
     # FC host statistics
-    collect_fc_stats "$OUTPUT_DIR/fc-stats-start.txt"
+    step "fc stats" 30 collect_fc_stats "$OUTPUT_DIR/fc-stats-start.txt"
 
     # Process info
-    collect_process_info > "$OUTPUT_DIR/process-info.txt" 2>&1
+    step "process info" 60 collect_process_info > "$OUTPUT_DIR/process-info.txt" 2>&1
 
     # ScoutFS statfs
-    if [[ -n "$SCOUTFS_MOUNT" ]] && command -v scoutfs >/dev/null 2>&1; then
-        scoutfs statfs -s "$SCOUTFS_MOUNT" >> "$OUTPUT_DIR/process-info.txt" 2>&1
+    # (-p PATH; -s takes a field name, and "statfs -s <mount>" only printed
+    # "unknown field").  Every scoutfs mount, each bounded: on a hung node
+    # one filesystem's statfs can block.
+    if command -v scoutfs >/dev/null 2>&1; then
+        local mnt
+        for mnt in $(awk '$3 == "scoutfs" {print $2}' /proc/mounts 2>/dev/null); do
+            echo "--- scoutfs statfs -p $mnt ---" >> "$OUTPUT_DIR/scoutfs-statfs.txt"
+            step "scoutfs statfs $mnt" 30 scoutfs statfs -p "$mnt" >> "$OUTPUT_DIR/scoutfs-statfs.txt" 2>&1
+        done
     fi
 
     # Thread diagnostics (always collected at start)
-    collect_thread_diagnostics
+    step "thread diagnostics" 60 collect_thread_diagnostics
 
     # Block device queue settings
-    collect_block_settings
+    step "block settings" 60 collect_block_settings
 
     # Device hierarchy (MDRAID, DM, multipath)
-    collect_device_hierarchy
+    step "device hierarchy" 120 collect_device_hierarchy
 
     # System-wide process listing
-    collect_processes
-
-    # Kernel logs and stack traces
-    collect_kernel_state
+    step "processes" 60 collect_processes
 }
 
 # Collect end snapshots
@@ -361,10 +520,16 @@ collect_end_snapshots() {
     cat /proc/vmstat > "$OUTPUT_DIR/vmstat-end.txt" 2>&1
 
     # ScoutFS counters (sysfs dir or debugfs file)
-    snapshot_scoutfs_counters "$OUTPUT_DIR/scoutfs-counters-end.txt"
+    step "scoutfs counters (end)" 30 snapshot_scoutfs_counters "$OUTPUT_DIR/scoutfs-counters-end.txt"
 
     # FC host statistics
-    collect_fc_stats "$OUTPUT_DIR/fc-stats-end.txt"
+    step "fc stats (end)" 30 collect_fc_stats "$OUTPUT_DIR/fc-stats-end.txt"
+
+    # Network, memory pressure, SCSI/tape
+    step "network (end)" 60 collect_network end > "$OUTPUT_DIR/network-end.txt" 2>&1
+    step "net counters (end)" 10 snapshot_net_counters > "$OUTPUT_DIR/net-counters-end.txt"
+    step "pressure (end)" 30 collect_pressure end
+    step "scsi stats (end)" 30 snapshot_scsi_stats > "$OUTPUT_DIR/scsi-stats-end.txt"
 }
 
 # Calculate deltas for cumulative counters
@@ -390,6 +555,22 @@ calculate_deltas() {
             "$OUTPUT_DIR/fc-stats-start.txt" \
             "$OUTPUT_DIR/fc-stats-end.txt" \
             "$OUTPUT_DIR/fc-stats-delta.txt"
+    fi
+
+    # TCP/IP counters delta (retransmits, drops, resets)
+    if [[ -s "$OUTPUT_DIR/net-counters-start.txt" && -s "$OUTPUT_DIR/net-counters-end.txt" ]]; then
+        calculate_counter_delta \
+            "$OUTPUT_DIR/net-counters-start.txt" \
+            "$OUTPUT_DIR/net-counters-end.txt" \
+            > "$OUTPUT_DIR/net-counters-delta.txt"
+    fi
+
+    # Tape and SCSI device counters delta
+    if [[ -s "$OUTPUT_DIR/scsi-stats-start.txt" && -s "$OUTPUT_DIR/scsi-stats-end.txt" ]]; then
+        calculate_counter_delta \
+            "$OUTPUT_DIR/scsi-stats-start.txt" \
+            "$OUTPUT_DIR/scsi-stats-end.txt" \
+            > "$OUTPUT_DIR/scsi-stats-delta.txt"
     fi
 }
 
@@ -636,10 +817,21 @@ collect_kernel_state() {
 
     # sysrq triggers require root - dump kernel stacks to dmesg
     if [[ $EUID -eq 0 ]]; then
+        # Kernel stacks of every D-state task, read straight from /proc so
+        # they cannot be lost to a wrapped dmesg ring buffer.
+        bounded 120 collect_dstate_stacks > "$OUTPUT_DIR/dstate-stacks.txt" 2>&1
+
         # Clear dmesg to isolate sysrq output
         dmesg --clear 2>/dev/null
 
-        # Stack traces for all stopped/blocked tasks
+        # Stack traces for blocked (D state) tasks only - small enough not
+        # to wrap the ring buffer, so capture it before the full 't' dump.
+        echo w > /proc/sysrq-trigger 2>/dev/null
+        sleep 1
+        dmesg -T > "$OUTPUT_DIR/sysrq-w.log" 2>&1
+        dmesg --clear 2>/dev/null
+
+        # Stack traces for all tasks
         echo t > /proc/sysrq-trigger 2>/dev/null
         sleep 1
         dmesg -T > "$OUTPUT_DIR/sysrq-t.log" 2>&1
@@ -655,6 +847,27 @@ collect_kernel_state() {
         echo "# Skipped - requires root" > "$OUTPUT_DIR/sysrq-t.log"
         echo "# Skipped - requires root" > "$OUTPUT_DIR/sysrq-l.log"
     fi
+}
+
+# Print the kernel stack of every task in uninterruptible (D) sleep.
+# Uses the read builtin (no fork per task) and touches only /proc.
+collect_dstate_stacks() {
+    echo "# Kernel stacks of tasks in D state - $(date)"
+    local stat st tdir comm wchan
+    for stat in /proc/[0-9]*/task/[0-9]*/stat; do
+        # Tasks exit mid-scan: the braces make 2>/dev/null cover the
+        # failed < redirection as well as read itself.
+        { read -r st < "$stat"; } 2>/dev/null || continue
+        st=${st##*) }
+        [[ "${st%% *}" == D ]] || continue
+        tdir=${stat%/stat}
+        comm=""; wchan=""
+        { read -r comm < "$tdir/comm"; } 2>/dev/null
+        { read -r wchan < "$tdir/wchan"; } 2>/dev/null
+        echo "=== ${tdir#/proc/} comm=$comm wchan=$wchan ==="
+        cat "$tdir/stack" 2>/dev/null
+        echo ""
+    done
 }
 
 # Collect process info
@@ -688,6 +901,7 @@ collect_process_info() {
 
 # Start background collectors
 start_collectors() {
+    [[ "$LOW_SPACE" == true ]] && return 0
     echo "Starting background collectors for ${DURATION}s..."
 
     # vmstat - 1 second interval
@@ -724,6 +938,20 @@ start_collectors() {
 # PID for trace-cmd (tracked separately for graceful shutdown)
 TRACE_CMD_PID=""
 
+# Total size cap for the scoutfs trace, in MB (--trace-max-mb).  Default:
+# a quarter of the free space at start, at most 4096.  trace-cmd's -m cap is
+# per CPU and keeps the most recent events once reached, so on a busy node
+# the trace covers the end of the run.
+TRACE_MAX_MB=""
+
+trace_cpu_kb() {
+    local ncpu kb
+    ncpu=$(getconf _NPROCESSORS_CONF 2>/dev/null || nproc)
+    kb=$(( TRACE_MAX_MB * 1024 / ${ncpu:-1} ))
+    (( kb < 1024 )) && kb=1024
+    echo "$kb"
+}
+
 # Start trace collection
 start_trace() {
     if [[ "$TRACE_ENABLED" != true ]]; then
@@ -732,14 +960,20 @@ start_trace() {
 
     echo "Starting trace collection..."
 
-    # trace-cmd for ScoutFS events
+    # trace-cmd for ScoutFS events.  It records until the sleep it runs
+    # exits; stop_trace ends it early by killing the sleep, so the trace
+    # covers the whole capture however long the start snapshots take.  The
+    # sleep is only a backstop if the script dies without stopping it.
     if command -v trace-cmd >/dev/null 2>&1; then
+        local cpu_kb
+        cpu_kb=$(trace_cpu_kb)
         (
-            cd "$OUTPUT_DIR"
-            trace-cmd record -e "scoutfs:*" sleep "$DURATION" 2>/dev/null
-        ) &
+            cd "$OUTPUT_DIR" || exit 1
+            exec trace-cmd record -m "$cpu_kb" -e "scoutfs:*" sleep $((DURATION + 3600))
+        ) < /dev/null > "$OUTPUT_DIR/trace-cmd.log" 2>&1 &
         TRACE_CMD_PID=$!
-        echo "trace-cmd recording ScoutFS events for ${DURATION}s"
+        echo "$(date '+%F %T') trace-cmd started: cap ${TRACE_MAX_MB} MB (${cpu_kb} KB per CPU)" >> "$OUTPUT_DIR/steps.log"
+        echo "trace-cmd recording ScoutFS events (cap ${TRACE_MAX_MB} MB)"
     fi
 }
 
@@ -749,26 +983,69 @@ stop_trace() {
         return
     fi
 
+    [[ -n "$TRACE_CMD_PID" ]] || return 0
+    local pid="$TRACE_CMD_PID" i
+    TRACE_CMD_PID=""
+
     echo "Stopping trace collection..."
 
-    # If trace-cmd is still running, send SIGINT to stop it gracefully
-    if [[ -n "$TRACE_CMD_PID" ]] && kill -0 "$TRACE_CMD_PID" 2>/dev/null; then
-        kill -INT "$TRACE_CMD_PID" 2>/dev/null
-        wait "$TRACE_CMD_PID" 2>/dev/null
+    # End the recording the way it ends on its own: the command trace-cmd
+    # runs exits, then trace-cmd stops and merges the per-CPU files.
+    pkill -TERM -x sleep -P "$pid" 2>/dev/null
+    for (( i = 0; i < 3000; i++ )); do     # the merge can take minutes
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "WARNING: trace-cmd did not exit after 300s; killing it" \
+            | tee -a "$OUTPUT_DIR/steps.log" >&2
+        kill -INT "$pid" 2>/dev/null
+        sleep 5
+        kill -9 "$pid" 2>/dev/null
     fi
+    echo "$(date '+%F %T') trace-cmd stopped" >> "$OUTPUT_DIR/steps.log"
 
     # Generate report and compress
     if [[ -f "$OUTPUT_DIR/trace.dat" ]]; then
         echo "Generating trace report..."
-        (cd "$OUTPUT_DIR" && trace-cmd report 2>/dev/null | gzip -9 > scoutfs-trace.gz && rm -f trace.dat)
+        step "trace report" 1200 \
+            bash -c 'cd "$1" && trace-cmd report 2>/dev/null | gzip -6 > scoutfs-trace.gz && rm -f trace.dat' \
+            _ "$OUTPUT_DIR"
+    fi
+
+    # Per-CPU files left by a failed merge can't be read without trace.dat
+    # and can be many GB; don't fill the disk again by tarring them.
+    if compgen -G "$OUTPUT_DIR/trace.dat.cpu*" > /dev/null; then
+        echo "$(date '+%F %T') WARNING: trace merge failed; removing unmerged per-CPU trace files ($(du -cm "$OUTPUT_DIR"/trace.dat.cpu* | awk 'END {print $1}') MB), see trace-cmd.log" \
+            | tee -a "$OUTPUT_DIR/steps.log" >&2
+        rm -f "$OUTPUT_DIR"/trace.dat.cpu*
     fi
 }
 
 # PID for perf top (tracked separately for graceful shutdown)
 PERF_TOP_PID=""
 
+# perf top is interactive: run in the background with no terminal it reads
+# EOF from stdin and redraws its key-help screen in a tight loop, which wrote
+# 2.8 GB in 30s on a 2-CPU test VM and 30 GB on vers06, filling /var/tmp
+# (zib/20261106).  Instead, sample every few seconds with perf record and
+# append the top of perf report: the same "what is on CPU" view, a few KB per
+# sample.
+PERF_SAMPLE_SECS=5
+
+perf_top_loop() {
+    local data="$OUTPUT_DIR/.perf-top.data"
+    while [[ ! -e "$OUTPUT_DIR/.perf-top.stop" ]]; do
+        perf record -a -F 99 -o "$data" -- sleep "$PERF_SAMPLE_SECS" >/dev/null 2>&1 || break
+        echo "=== $(date '+%F %T') (${PERF_SAMPLE_SECS}s, all CPUs) ==="
+        perf report -i "$data" --stdio --no-children --sort comm,dso,symbol 2>/dev/null \
+            | grep -v -e '^#' -e '^$' | head -50
+    done
+    rm -f "$data" "$data.old"
+}
+
 start_perf_top() {
-    if [[ "$PERF_TOP_ENABLED" != true ]]; then
+    if [[ "$PERF_TOP_ENABLED" != true || "$LOW_SPACE" == true ]]; then
         return
     fi
 
@@ -778,58 +1055,103 @@ start_perf_top() {
         return
     fi
 
-    echo "Starting perf top collection for ${DURATION}s..."
-    perf top -a -d 1 --stdio > "$OUTPUT_DIR/perf-top.log" 2>&1 &
+    echo "Starting perf sampling (perf-top.log.gz) for ${DURATION}s..."
+    rm -f "$OUTPUT_DIR/.perf-top.stop"
+    perf_top_loop < /dev/null > >(gzip -1 > "$OUTPUT_DIR/perf-top.log.gz") 2>&1 &
     PERF_TOP_PID=$!
 }
 
 stop_perf_top() {
-    if [[ "$PERF_TOP_ENABLED" != true ]]; then
+    if [[ "$PERF_TOP_ENABLED" != true || -z "$PERF_TOP_PID" ]]; then
         return
     fi
 
-    if [[ -n "$PERF_TOP_PID" ]] && kill -0 "$PERF_TOP_PID" 2>/dev/null; then
-        echo "Stopping perf top..."
-        kill -INT "$PERF_TOP_PID" 2>/dev/null
-        wait "$PERF_TOP_PID" 2>/dev/null
+    echo "Stopping perf sampling..."
+    touch "$OUTPUT_DIR/.perf-top.stop"
+    # The current sample finishes within PERF_SAMPLE_SECS; never wait longer
+    # than that plus margin (perf can block on a hung node).
+    local i
+    for (( i = 0; i < (PERF_SAMPLE_SECS + 10) * 10; i++ )); do
+        kill -0 "$PERF_TOP_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$PERF_TOP_PID" 2>/dev/null; then
+        pkill -9 -P "$PERF_TOP_PID" 2>/dev/null
+        kill -9 "$PERF_TOP_PID" 2>/dev/null
     fi
-
-    if [[ -f "$OUTPUT_DIR/perf-top.log" ]]; then
-        echo "Compressing perf-top.log..."
-        gzip -9 "$OUTPUT_DIR/perf-top.log"
-    fi
+    PERF_TOP_PID=""
+    rm -f "$OUTPUT_DIR/.perf-top.stop" "$OUTPUT_DIR/.perf-top.data" "$OUTPUT_DIR/.perf-top.data.old"
+    sleep 1    # let gzip flush perf-top.log.gz
 }
 
 # Copy a sysfs/debugfs tree under the given destination dir.  These files
 # don't report their real size (debugfs reports 0, sysfs 4096), so tar
 # would archive them empty or padded with zeros; read them instead.
+#
+# The file list is written to a local file under a bound first: an unbounded
+# `find | while read` stalls the whole copy if find blocks.  Files named in
+# the remaining arguments (relative to src) are copied before the rest.
 copy_tree() {
-    local dest="$1" src="$2" f
+    local dest="$1" src="$2" f list
+    shift 2
     [[ -d "$src" ]] || return 1
 
-    find "$src" -type f 2>/dev/null | while read -r f; do
-        mkdir -p "$dest$(dirname "$f")"
-        timeout 30 cat "$f" > "$dest$f" 2>&1
+    list=$(mktemp "$OUTPUT_DIR/.tree-XXXXXX")
+    bounded 20 find "$src" -type f > "$list" 2>/dev/null
+    for f in "$@"; do
+        [[ -f "$src/$f" ]] || continue
+        mkdir -p "$dest$(dirname "$src/$f")"
+        bounded 10 cat "$src/$f" > "$dest$src/$f" 2>&1
     done
+    while read -r f; do
+        [[ -e "$dest$f" ]] && continue
+        mkdir -p "$dest$(dirname "$f")"
+        bounded 10 cat "$f" > "$dest$f" 2>&1
+    done < "$list"
+    rm -f "$list"
 }
 
 # Collect the full ScoutFS sysfs and debugfs trees (Cookbook per-node data).
 # Counters, mount/volume options, quorum, fence and srch state all live in
 # the sysfs tree on current builds.
-collect_scoutfs_trees() {
-    if [[ -d /sys/fs/scoutfs ]]; then
-        echo "Collecting ScoutFS sysfs tree..."
-        copy_tree "$OUTPUT_DIR/sysfs" /sys/fs/scoutfs
-    else
-        echo "WARNING: /sys/fs/scoutfs not found, skipping sysfs tree"
-    fi
+#
+# debugfs comes first: its lock and message state (server_locks,
+# client_locks, messages, connections) is in memory and is what a lock hang
+# is diagnosed from, while some sysfs files (quorum, volume_options) can
+# block on a wedged node.  Each filesystem is its own bounded step, so one
+# stuck filesystem cannot cost the others.
+SCOUTFS_LOCK_STATE=(server_locks client_locks messages connections server_lock_stats)
 
+collect_scoutfs_trees() {
+    local d
     if [[ -d /sys/kernel/debug/scoutfs ]]; then
         echo "Collecting ScoutFS debugfs tree..."
-        copy_tree "$OUTPUT_DIR/debugfs" /sys/kernel/debug/scoutfs
+        for d in /sys/kernel/debug/scoutfs/*/; do
+            [[ -d "$d" ]] || continue
+            step "debugfs $(basename "$d")" 90 \
+                copy_tree "$OUTPUT_DIR/debugfs" "${d%/}" "${SCOUTFS_LOCK_STATE[@]}"
+        done
+        # Top-level files (older builds keep counters here).
+        for d in /sys/kernel/debug/scoutfs/*; do
+            [[ -f "$d" ]] || continue
+            mkdir -p "$OUTPUT_DIR/debugfs/sys/kernel/debug/scoutfs"
+            bounded 10 cat "$d" > "$OUTPUT_DIR/debugfs$d" 2>&1
+        done
     else
         echo "WARNING: /sys/kernel/debug/scoutfs not found, skipping debugfs tree"
     fi
+
+    if [[ -d /sys/fs/scoutfs ]]; then
+        echo "Collecting ScoutFS sysfs tree..."
+        for d in /sys/fs/scoutfs/*/; do
+            [[ -d "$d" ]] || continue
+            step "sysfs $(basename "$d")" 90 copy_tree "$OUTPUT_DIR/sysfs" "${d%/}"
+        done
+    else
+        echo "WARNING: /sys/fs/scoutfs not found, skipping sysfs tree"
+    fi
+    # File lists left by abandoned copies.
+    rm -f "$OUTPUT_DIR"/.tree-*
 }
 
 # Capture fencing configuration (/etc/scoutfs and the fenced run file).
@@ -853,6 +1175,190 @@ collect_fencing_config() {
 # Inventory any existing crashdumps (do not generate new ones).
 collect_crashdumps() {
     find /var/crash -ls > "$OUTPUT_DIR/crash_ls.txt" 2>&1
+}
+
+# Hang samples: ScoutFS lock and message state, D-state task stacks and TCP
+# connection queues every HANG_SAMPLE_SECS for the whole run.  One snapshot
+# cannot tell a deadlock from slow progress; a series can (a deadlock shows
+# the same tasks waiting on the same locks in every sample).
+HANG_SAMPLE_SECS=10
+HANG_SAMPLES_ENABLED=true
+
+collect_hang_sample() {
+    local dir="$OUTPUT_DIR/hang-samples/$1" d f fs
+    mkdir -p "$dir"
+    collect_dstate_stacks > "$dir/dstate-stacks.txt" 2>&1
+    for d in /sys/kernel/debug/scoutfs/*/; do
+        [[ -d "$d" ]] || continue
+        fs=$(basename "$d")
+        for f in "${SCOUTFS_LOCK_STATE[@]}"; do
+            [[ -f "$d$f" ]] || continue
+            bounded 3 cat "$d$f" > "$dir/$fs-$f" 2>&1
+        done
+    done
+    if command -v ss >/dev/null 2>&1; then
+        bounded 3 ss -tnpie > "$dir/ss.txt" 2>&1
+    fi
+}
+
+# Take one hang sample, named by seconds into the run (t0000, t0010, ...).
+# Bounded below the sample interval so a stuck read cannot stall the loop.
+take_hang_sample() {
+    [[ "$HANG_SAMPLES_ENABLED" == true ]] || return 0
+    bounded $((HANG_SAMPLE_SECS - 2)) collect_hang_sample "$(printf 't%04d' "$1")"
+}
+
+# Kernel, ScoutFS and ScoutAM versions.  sosreport also has these, but it is
+# skipped with --no-sos and can time out on a hung node.
+collect_versions() {
+    local f
+    echo "# Versions - $(date)"
+    echo "=== uname -a ==="; uname -a
+    echo; echo "=== /etc/os-release ==="; cat /etc/os-release
+    echo; echo "=== /proc/cmdline ==="; cat /proc/cmdline
+    echo; echo "=== uptime ==="; uptime
+    echo; echo "=== /sys/module/scoutfs ==="
+    for f in version srcversion; do
+        [[ -r "/sys/module/scoutfs/$f" ]] && echo "$f: $(cat "/sys/module/scoutfs/$f")"
+    done
+    echo; echo "=== modinfo scoutfs ==="; modinfo scoutfs
+    echo; echo "=== lsmod ==="; lsmod
+    echo; echo "=== packages (scout*, kernel*, trace-cmd) ==="
+    rpm -qa 2>/dev/null | grep -i -E 'scout|^kernel|trace-cmd' | sort
+}
+
+# systemd journals: fencing actions, quorum elections and scoutamd errors are
+# logged there, not to dmesg, and dmesg's ring buffer can wrap.  The previous
+# boot is included in case the node was fenced and rebooted (it is only there
+# if the journal is persistent).
+JOURNAL_SINCE="-24h"
+
+collect_journals() {
+    command -v journalctl >/dev/null 2>&1 || return 0
+    local dir="$OUTPUT_DIR/journal" unit
+    local -a units=() uargs=()
+    mkdir -p "$dir"
+
+    journalctl --list-boots --no-pager > "$dir/boots.txt" 2>&1
+    systemctl list-units --all --no-pager 'scout*' > "$dir/scout-units.txt" 2>&1
+    systemctl status --all --no-pager -l 'scout*' > "$dir/scout-units-status.txt" 2>&1
+
+    while read -r unit _; do
+        [[ -n "$unit" ]] && units+=("$unit") && uargs+=(-u "$unit")
+    done < <(systemctl list-units --all --plain --no-legend 'scout*' 2>/dev/null)
+
+    for unit in "${units[@]}"; do
+        journalctl --no-pager -o short-precise -u "$unit" --since "$JOURNAL_SINCE" 2>&1 \
+            | gzip -1 > "$dir/$unit.log.gz"
+    done
+    if [[ ${#uargs[@]} -gt 0 ]]; then
+        journalctl --no-pager -o short-precise -b -1 "${uargs[@]}" 2>&1 \
+            | gzip -1 > "$dir/scout-units-prev-boot.log.gz"
+    fi
+    journalctl --no-pager -o short-precise -k -b 0 2>&1 | gzip -1 > "$dir/kernel-this-boot.log.gz"
+    journalctl --no-pager -o short-precise -k -b -1 2>&1 | gzip -1 > "$dir/kernel-prev-boot.log.gz"
+}
+
+# Network state.  ScoutFS lock requests and responses travel between nodes
+# over TCP: a Send-Q that does not drain next to a lock request that is not
+# granted points at the network.  Interface and NIC counters are taken at
+# start and end; TCP/IP counters go to net-counters-*.txt for a delta.
+collect_network() {
+    local tag="$1" ifc
+    echo "# Network state ($tag) - $(date)"
+    echo "=== ss -tnpie ==="; bounded 10 ss -tnpie
+    echo; echo "=== ip -s -s link ==="; ip -s -s link
+    if [[ "$tag" == start ]]; then
+        echo; echo "=== ip addr ==="; ip addr
+        echo; echo "=== ip route ==="; ip route
+    fi
+    if command -v ethtool >/dev/null 2>&1; then
+        for ifc in /sys/class/net/*; do
+            [[ -e "$ifc/device" ]] || continue    # physical NICs only
+            ifc=$(basename "$ifc")
+            if [[ "$tag" == start ]]; then
+                echo; echo "=== ethtool $ifc ==="; bounded 5 ethtool "$ifc"
+            fi
+            echo; echo "=== ethtool -S $ifc ==="; bounded 5 ethtool -S "$ifc"
+        done
+    fi
+}
+
+# /proc/net/snmp and /proc/net/netstat as "Proto.Name value" lines (each
+# protocol is a header line followed by a value line).
+snapshot_net_counters() {
+    awk '$1 in hdr { n = split(hdr[$1], h)
+                     for (i = 2; i <= NF && i <= n; i++)
+                         print substr($1, 1, length($1) - 1) "." h[i], $i
+                     delete hdr[$1]; next }
+         { hdr[$1] = $0 }' /proc/net/snmp /proc/net/netstat 2>/dev/null
+}
+
+# Clock sync.  Lining up logs from different nodes depends on it, and quorum
+# relies on timeouts.
+collect_time_sync() {
+    echo "# Time sync - $(date)"
+    echo "=== date (UTC) ==="; date -u '+%F %T.%N %Z'
+    if command -v timedatectl >/dev/null 2>&1; then
+        echo; echo "=== timedatectl ==="; bounded 10 timedatectl
+    fi
+    if command -v chronyc >/dev/null 2>&1; then
+        echo; echo "=== chronyc tracking ==="; bounded 10 chronyc tracking
+        echo; echo "=== chronyc sources -v ==="; bounded 10 chronyc sources -v
+    elif command -v ntpq >/dev/null 2>&1; then
+        echo; echo "=== ntpq -p ==="; bounded 10 ntpq -p
+    fi
+}
+
+# Memory and pressure state: PSI (cpu/memory/io stall time), slab usage and
+# free-page fragmentation, at start and end.
+collect_pressure() {
+    local tag="$1" r
+    if [[ -d /proc/pressure ]]; then
+        for r in cpu memory io; do
+            echo "=== $r ==="
+            cat "/proc/pressure/$r"
+        done > "$OUTPUT_DIR/pressure-$tag.txt" 2>&1
+    else
+        # RHEL kernels ship with PSI disabled; it needs psi=1 on the cmdline.
+        echo "# PSI not available (/proc/pressure missing; boot with psi=1 to enable)" \
+            > "$OUTPUT_DIR/pressure-$tag.txt"
+    fi
+    cat /proc/buddyinfo > "$OUTPUT_DIR/buddyinfo-$tag.txt" 2>&1
+    cat /proc/slabinfo > "$OUTPUT_DIR/slabinfo-$tag.txt" 2>&1
+}
+
+# SCSI and tape devices on the archive path.
+collect_scsi_inventory() {
+    if command -v lsscsi >/dev/null 2>&1; then
+        echo "=== lsscsi -g ==="; lsscsi -g
+        echo; echo "=== lsscsi -t ==="; lsscsi -t
+    else
+        echo "=== /proc/scsi/scsi ==="; cat /proc/scsi/scsi
+    fi
+}
+
+# Tape drive I/O statistics and per-SCSI-device request/error counts as
+# "name value" lines, for a start/end delta.  Each tape has several mode
+# devices (st0, st0l, nst0, ...) sharing one set of stats: read st<N> only.
+snapshot_scsi_stats() {
+    local d f name v
+    for d in /sys/class/scsi_tape/st*; do
+        name=$(basename "$d")
+        [[ "$name" =~ ^st[0-9]+$ && -d "$d/stats" ]] || continue
+        for f in "$d"/stats/*; do
+            v=$(cat "$f" 2>/dev/null)
+            [[ "$v" =~ ^[0-9]+$ ]] && echo "$name.$(basename "$f") $v"
+        done
+    done
+    for d in /sys/class/scsi_device/*/device; do
+        name=$(basename "$(dirname "$d")")
+        for f in iorequest_cnt iodone_cnt ioerr_cnt iotmo_cnt; do
+            v=$(cat "$d/$f" 2>/dev/null)
+            # These counters are hex (0x1a2b).
+            [[ "$v" =~ ^(0x[0-9a-fA-F]+|[0-9]+)$ ]] && echo "$name.$f $((v))"
+        done
+    done
 }
 
 # Snapshot ScoutFS counters to a "name value" file for delta computation.
@@ -882,7 +1388,7 @@ snapshot_scoutfs_counters() {
 # Check if pprof port is responding
 check_pprof_port() {
     local port="$1"
-    curl -s --connect-timeout 2 "http://127.0.0.1:$port/debug/pprof/" >/dev/null 2>&1
+    curl -s --connect-timeout 2 --max-time 5 "http://127.0.0.1:$port/debug/pprof/" >/dev/null 2>&1
 }
 
 # Collect initial pprof data (heap, block, mutex) from a single port
@@ -977,7 +1483,7 @@ collect_scheduler_profile() {
     fi
 
     echo "Collecting scheduler CPU profile (${SCHEDULER_PROFILE_SECONDS}s)..."
-    curl --silent --show-error \
+    curl --silent --show-error --max-time $((SCHEDULER_PROFILE_SECONDS + 30)) \
         "http://localhost:6060/debug/pprof/profile?seconds=${SCHEDULER_PROFILE_SECONDS}" \
         --output "${OUTPUT_DIR}/pprof/scheduler.prof" 2>&1 \
         || echo "Warning: failed to collect scheduler profile" >&2
@@ -1045,6 +1551,12 @@ collect_sos_report() {
         return 0
     fi
 
+    # A sosreport takes hundreds of MB more in /var/tmp.
+    if [[ "$LOW_SPACE" == true || -e "$OUTPUT_DIR/.low-space" ]]; then
+        echo "WARNING: low disk space, skipping SOS report" | tee -a "$OUTPUT_DIR/steps.log" >&2
+        return 0
+    fi
+
     # Check if sos is installed
     if ! command -v sos >/dev/null 2>&1; then
         echo "WARNING: sos command not found, skipping SOS report collection"
@@ -1059,10 +1571,11 @@ collect_sos_report() {
     local sos_exit_code
 
     # sos can hang on a wedged node; bound it so the tarball still gets made.
-    # --foreground keeps sos in the terminal's process group, otherwise commands
-    # it runs that touch the tty (e.g. slabtop) are stopped by SIGTTOU.
-    sos_output=$(timeout --foreground -k 60 1800 sos report --batch --quiet 2>&1)
+    # Output goes to a file, not $(...): command substitution would wait on
+    # an abandoned D-state child holding the pipe open.
+    bounded 1800 sos report --batch --quiet > "$OUTPUT_DIR/sos-output.txt" 2>&1
     sos_exit_code=$?
+    sos_output=$(cat "$OUTPUT_DIR/sos-output.txt")
 
     if [[ $sos_exit_code -ne 0 ]]; then
         echo "WARNING: sos report failed with exit code $sos_exit_code"
@@ -1124,6 +1637,14 @@ parse_args() {
                 TRACE_ENABLED=false
                 shift
                 ;;
+            --trace-max-mb)
+                TRACE_MAX_MB="$2"
+                if ! [[ "$TRACE_MAX_MB" =~ ^[0-9]+$ ]] || (( TRACE_MAX_MB < 64 )); then
+                    echo "ERROR: --trace-max-mb must be an integer of at least 64"
+                    exit 1
+                fi
+                shift 2
+                ;;
             --output)
                 OUTPUT_DIR="$2"
                 shift 2
@@ -1184,9 +1705,30 @@ main() {
 
     # Set up output directory
     if [[ -z "$OUTPUT_DIR" ]]; then
-        OUTPUT_DIR="triage-$(hostname -s)-$(date +%Y%m%d-%H%M%S)"
+        # Absolute path on local disk: if the cwd is on a hung ScoutFS mount,
+        # mkdir and trace-cmd's trace.dat writes would block.
+        OUTPUT_DIR="/var/tmp/triage-$(hostname -s)-$(date +%Y%m%d-%H%M%S)"
     fi
     mkdir -p "$OUTPUT_DIR"
+
+    # A capture with a sosreport needs a few GB; with less, steps fail
+    # silently (writes get ENOSPC) and the capture is incomplete.
+    local free
+    free=$(free_mb)
+    if [[ -n "$free" ]] && (( free < 4096 )); then
+        echo "ERROR: only ${free} MB free under $OUTPUT_DIR (need 4096 MB)."
+        echo "       Free space there (old triage-* directories) or use --output DIR on another local disk."
+        # Nothing collected yet: skip the EXIT trap's tarball and clean up.
+        trap - EXIT SIGINT SIGTERM
+        rmdir "$OUTPUT_DIR" 2>/dev/null
+        exit 1
+    fi
+    echo "$(date '+%F %T') free space under $OUTPUT_DIR: ${free:-?} MB" >> "$OUTPUT_DIR/steps.log"
+
+    if [[ -z "$TRACE_MAX_MB" ]]; then
+        TRACE_MAX_MB=$(( ${free:-16384} / 4 ))
+        (( TRACE_MAX_MB > 4096 )) && TRACE_MAX_MB=4096
+    fi
 
     echo "============================================="
     echo "ScoutFS/ScoutAM Triage Collection"
@@ -1205,14 +1747,17 @@ main() {
     # Check utilities
     check_utilities
 
+    # Start the scoutfs trace first so it is running even if a later
+    # collection step stalls on a hung node.
+    start_trace
+    start_space_watchdog
+
     # Collect start snapshots
     collect_start_snapshots
+    check_space
 
     # Start background collectors
     start_collectors
-
-    # Start trace if enabled
-    start_trace
 
     # Start perf top if enabled
     start_perf_top
@@ -1228,19 +1773,24 @@ main() {
     echo "Collecting data... Press Ctrl+C to stop early."
     echo ""
 
-    # Wait for duration, collecting goroutine dumps every 10s
-    local elapsed=0
+    # Wait for duration, collecting goroutine dumps and hang samples every
+    # 10s.  Sleep to the next 10s mark rather than a fixed 10s, so time spent
+    # collecting does not stretch the run.
+    local elapsed=0 start=$SECONDS nap
 
-    # Collect goroutines at t=0
+    # Collect at t=0
     collect_pprof_goroutines $elapsed
+    take_hang_sample $elapsed
 
     while [[ $elapsed -lt $DURATION ]]; do
-        sleep 10
-        elapsed=$((elapsed + 10))
+        elapsed=$((elapsed + HANG_SAMPLE_SECS))
+        nap=$((start + elapsed - SECONDS))
+        (( nap > 0 )) && sleep "$nap"
+        check_space
         if [[ $elapsed -lt $DURATION ]]; then
             echo "  ${elapsed}s / ${DURATION}s elapsed..."
-            # Collect goroutine dumps periodically
             collect_pprof_goroutines $elapsed
+            take_hang_sample $elapsed
         fi
     done
 
